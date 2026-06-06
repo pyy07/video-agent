@@ -1,0 +1,75 @@
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { createProjectAction } from "@/app/actions";
+import type { ProjectType } from "@/lib/projectTypes";
+import {
+  HtmlVideoIllustration,
+  ImageCarouselIllustration,
+  ModeCard,
+} from "./ModeCard";
+
+export function CreateModeCards() {
+  const router = useRouter();
+  const [pending, startTransition] = useTransition();
+  const [activeMode, setActiveMode] = useState<ProjectType | null>(null);
+  const [error, setError] = useState<{
+    mode: ProjectType;
+    message: string;
+  } | null>(null);
+
+  function handleCreate(mode: ProjectType) {
+    if (pending) return;
+    setActiveMode(mode);
+    setError(null);
+    startTransition(async () => {
+      const result = await createProjectAction(mode);
+      if (!result.ok) {
+        setError({ mode, message: result.error });
+        setActiveMode(null);
+        return;
+      }
+      // 路由跳转后保持 loading 视觉，避免回到默认态闪烁
+      router.push(`/create?id=${result.uuid}&mode=${mode}`);
+    });
+  }
+
+  const loadingMode = pending ? activeMode : null;
+
+  return (
+    <section className="mt-12 grid w-full max-w-5xl grid-cols-1 gap-6 md:grid-cols-2">
+      <ModeCard
+        theme="brand"
+        recommended
+        title="图片轮播模式"
+        description="AI 生成精美图片，多图轮播生成视频，适合讲故事、知识科普、营销宣传等场景。"
+        features={[
+          "文生图 AI 生成图片",
+          "多图自动轮播",
+          "旁白配音 & 背景音乐",
+        ]}
+        illustration={<ImageCarouselIllustration />}
+        loading={loadingMode === "image"}
+        disabled={pending && loadingMode !== "image"}
+        error={error?.mode === "image" ? error.message : null}
+        onCreate={() => handleCreate("image")}
+      />
+      <ModeCard
+        theme="accent"
+        title="HTML 视频模式"
+        description="AI 生成网页动画，多动画片段组合成视频，适合数据可视化、产品演示、教育课件等场景。"
+        features={[
+          "AI 生成网页动画",
+          "丰富的动画效果",
+          "交互式演示体验",
+        ]}
+        illustration={<HtmlVideoIllustration />}
+        loading={loadingMode === "html"}
+        disabled={pending && loadingMode !== "html"}
+        error={error?.mode === "html" ? error.message : null}
+        onCreate={() => handleCreate("html")}
+      />
+    </section>
+  );
+}
