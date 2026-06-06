@@ -5,6 +5,7 @@ import { BarChart3, Code2, Eye, ImageIcon, Loader2, MoreHorizontal, Plus, Sparkl
 import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { pickSceneCover } from "./sceneCover";
+import { projectAudioUrl } from "@/lib/audioUrl";
 import type { OutlineScene } from "@/lib/outlineTypes";
 import type { ProjectType } from "@/lib/projectTypes";
 
@@ -30,6 +31,8 @@ type StoryboardListProps = {
   onOpenOutlineModal: () => void;
   /** 底栏模式：固定高度容器内紧凑展示 */
   dock?: boolean;
+  /** 最近一次整片音频生成时间，用于 cache bust */
+  audioGeneratedAt?: string;
 };
 
 const CHARS_PER_SECOND = 4;
@@ -47,6 +50,7 @@ export function StoryboardList({
   onBulkGenerate,
   onOpenOutlineModal,
   dock = false,
+  audioGeneratedAt,
 }: StoryboardListProps) {
   const isHtmlMode = projectType === "html";
 
@@ -193,6 +197,7 @@ export function StoryboardList({
                 onGenerate={() => onGenerateScene(scene.index)}
                 imageNonce={imageNonce}
                 projectType={projectType}
+                audioGeneratedAt={audioGeneratedAt}
               />
             </li>
           ))}
@@ -216,6 +221,7 @@ type StoryboardCardProps = {
   /** 大纲版本戳，附加到图片 URL 上强制刷新 */
   imageNonce: number;
   projectType: ProjectType;
+  audioGeneratedAt?: string;
 };
 
 function StoryboardCard({
@@ -229,6 +235,7 @@ function StoryboardCard({
   onGenerate,
   imageNonce,
   projectType,
+  audioGeneratedAt,
 }: StoryboardCardProps) {
   const isHtmlMode = projectType === "html";
   const cover = pickSceneCover(scene.index);
@@ -251,8 +258,16 @@ function StoryboardCard({
     : null;
 
   const audioUrl = hasAudio && projectId
-    ? `/api/project-audio/${projectId}/${scene.index}.mp3`
+    ? projectAudioUrl(projectId, scene.index, audioGeneratedAt)
     : null;
+
+  // 音频版本变化时重置播放器，避免继续播旧缓存
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+  }, [audioUrl]);
 
   const handleAudioClick = (e: React.MouseEvent) => {
     e.stopPropagation();

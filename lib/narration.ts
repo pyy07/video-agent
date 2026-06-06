@@ -101,7 +101,7 @@ export function clauseIndexAt(clauses: NarrationClause[], ratio: number): number
  * 用 Intl.Segmenter 拿到字素簇数（CJK 字符算 1，emoji 不会被错分成 2）。
  * 不可用时回退 [...str].length（按 code point 分），仍然比 .length 更准。
  */
-function visualLength(s: string): number {
+export function visualLength(s: string): number {
   if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
     try {
       const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });

@@ -14,6 +14,11 @@ import {
 import { toCanvas } from "html-to-image";
 import { pickSceneCover } from "./sceneCover";
 import { clauseIndexAt, splitNarration } from "@/lib/narration";
+import { projectAudioUrl, projectFullAudioUrl } from "@/lib/audioUrl";
+import {
+  computeSceneAudioSlices,
+  sceneAudioMapsFromSlices,
+} from "@/lib/audioSlices";
 import type { OutlineScene } from "@/lib/outlineTypes";
 import type { ProjectType } from "@/lib/projectTypes";
 
@@ -22,6 +27,8 @@ type VideoPreviewProps = {
   showSubtitle: boolean;
   projectId: string | null;
   allScenes: OutlineScene[];
+  /** 最近一次整片音频生成时间，用于 cache bust */
+  audioGeneratedAt?: string;
   /** 项目模式：image 模式用图片，html 模式用 iframe 嵌入动画 */
   projectType: ProjectType;
   /**
@@ -71,6 +78,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       showSubtitle,
       projectId,
       allScenes,
+      audioGeneratedAt,
       projectType,
       recordingMode = false,
       recordingCaptureReady = true,
@@ -120,6 +128,14 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
 
     // 当前正在播放的 <audio> 元素。给 recorder 抓 captureStream 用。
     const audioRef = useRef<HTMLAudioElement | null>(null);
+    // 整片 mp3 URL 绑定标记（audioGeneratedAt 变化时需重建）
+    const boundFullAudioUrlRef = useRef<string | null>(null);
+    // 各镜在整片 mp3 中的起始秒数
+    const sceneStartSecRef = useRef<Record<number, number>>({});
+    const currentIndexRef = useRef(currentIndex);
+    useEffect(() => {
+      currentIndexRef.current = currentIndex;
+    }, [currentIndex]);
     // 包装赋值：每次换 audio 都通知父级（recorder 要 setAudioElement 跟）
     const setAudio = useCallback(
       (audio: HTMLAudioElement | null) => {
@@ -159,34 +175,102 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
 
     const currentScene = allScenes[currentIndex] ?? scene;
 
-    // 音频时长加载
-    const loadAudioDuration = useCallback((sc: OutlineScene): Promise<number> => {
-      if (!projectId || !sc.audioPath) return Promise.resolve(DEFAULT_SCENE_DURATION);
+    // 读取整片 mp3 时长，并按与服务端一致的算法切分各镜时间轴
+    const loadFullAudioDuration = useCallback((): Promise<number | null> => {
+      if (!projectId || !allScenes.some((s) => s.audioPath)) {
+        return Promise.resolve(null);
+      }
       return new Promise((resolve) => {
-        const audio = new Audio(`/api/project-audio/${projectId}/${sc.index}.mp3`);
+        const audio = new Audio(projectFullAudioUrl(projectId, audioGeneratedAt));
         let settled = false;
-        const settle = (val: number) => { if (!settled) { settled = true; resolve(val); } };
-        audio.addEventListener("loadedmetadata", () => settle(Math.max(audio.duration, DEFAULT_SCENE_DURATION)));
-        audio.addEventListener("error", () => settle(DEFAULT_SCENE_DURATION));
-        setTimeout(() => settle(DEFAULT_SCENE_DURATION), 5000);
+        const settle = (val: number | null) => {
+          if (!settled) {
+            settled = true;
+            resolve(val);
+          }
+        };
+        audio.addEventListener("loadedmetadata", () => {
+          const dur = audio.duration;
+          settle(Number.isFinite(dur) && dur > 0 ? dur : null);
+        });
+        audio.addEventListener("error", () => settle(null));
+        setTimeout(() => settle(null), 8000);
       });
-    }, [projectId]);
+    }, [projectId, allScenes, audioGeneratedAt]);
 
-    // 预加载所有分镜音频时长
+    const loadPerSceneDurations = useCallback(async (): Promise<{
+      durations: Record<number, number>;
+      starts: Record<number, number>;
+      totalSec: number;
+    }> => {
+      const durations: Record<number, number> = {};
+      let cursor = 0;
+      await Promise.all(
+        allScenes.map(async (sc) => {
+          if (!projectId || !sc.audioPath) {
+            durations[sc.index] = DEFAULT_SCENE_DURATION;
+            return;
+          }
+          const dur = await new Promise<number>((resolve) => {
+            const audio = new Audio(
+              projectAudioUrl(projectId, sc.index, audioGeneratedAt),
+            );
+            let settled = false;
+            const settle = (val: number) => {
+              if (!settled) {
+                settled = true;
+                resolve(val);
+              }
+            };
+            audio.addEventListener("loadedmetadata", () =>
+              settle(Math.max(audio.duration, DEFAULT_SCENE_DURATION)),
+            );
+            audio.addEventListener("error", () => settle(DEFAULT_SCENE_DURATION));
+            setTimeout(() => settle(DEFAULT_SCENE_DURATION), 5000);
+          });
+          durations[sc.index] = dur;
+        }),
+      );
+      const starts: Record<number, number> = {};
+      for (const sc of allScenes) {
+        starts[sc.index] = cursor;
+        cursor += durations[sc.index] ?? DEFAULT_SCENE_DURATION;
+      }
+      return { durations, starts, totalSec: cursor };
+    }, [projectId, allScenes, audioGeneratedAt]);
+
     useEffect(() => {
       if (allScenes.length === 0) return;
-      Promise.all(allScenes.map((sc) => loadAudioDuration(sc))).then((durations) => {
-        const loaded: Record<number, number> = {};
-        let total = 0;
-        allScenes.forEach((sc, i) => {
-          const dur = durations[i] ?? DEFAULT_SCENE_DURATION;
-          loaded[sc.index] = dur;
-          total += dur;
-        });
-        setSceneDurations(loaded);
-        setTotalDuration(total > 0 ? total : allScenes.length * DEFAULT_SCENE_DURATION);
-      });
-    }, [allScenes, loadAudioDuration]);
+      let cancelled = false;
+
+      (async () => {
+        const fullDur = await loadFullAudioDuration();
+        if (cancelled) return;
+
+        if (fullDur && fullDur > 0) {
+          const slices = computeSceneAudioSlices(allScenes, fullDur);
+          const { durations, starts, totalSec } = sceneAudioMapsFromSlices(slices);
+          setSceneDurations(durations);
+          sceneStartSecRef.current = starts;
+          setTotalDuration(totalSec > 0 ? totalSec : fullDur);
+          return;
+        }
+
+        const fallback = await loadPerSceneDurations();
+        if (cancelled) return;
+        setSceneDurations(fallback.durations);
+        sceneStartSecRef.current = fallback.starts;
+        setTotalDuration(
+          fallback.totalSec > 0
+            ? fallback.totalSec
+            : allScenes.length * DEFAULT_SCENE_DURATION,
+        );
+      })();
+
+      return () => {
+        cancelled = true;
+      };
+    }, [allScenes, loadFullAudioDuration, loadPerSceneDurations, audioGeneratedAt]);
 
     // 清理所有定时器
     const clearAll = useCallback(() => {
@@ -202,34 +286,85 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setPrevOpacity(1);
     }, []);
 
-    // 播放音频（录制时在 playing 事件后再通知 recorder，确保 Web Audio 能采到音）
-    const playAudio = useCallback((sc: OutlineScene) => {
-      if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-      if (!projectId || !sc.audioPath) {
+    const handleFullAudioEnded = useCallback(() => {
+      isRunningRef.current = false;
+      setIsPlaying(false);
+      setCurrentIndex(0);
+      setCurrentTime(0);
+      setKenBurnsScale(1);
+      clearPrevLayer();
+      if (recordingMode) {
+        onRecordingComplete?.();
+      }
+    }, [clearPrevLayer, recordingMode, onRecordingComplete]);
+
+    // 播放整片 mp3 并从指定时间点开始（分镜切换时不重启，保证语调连贯）
+    const playFullAudioFrom = useCallback((sec: number) => {
+      if (!projectId || !allScenes.some((s) => s.audioPath)) {
         setAudio(null);
         return;
       }
-      const audio = new Audio(`/api/project-audio/${projectId}/${sc.index}.mp3`);
-      audioRef.current = audio;
-      audio.addEventListener(
-        "playing",
-        () => onAudioElementChange?.(audio),
-        { once: true },
-      );
-      audio.addEventListener(
-        "error",
-        () => onAudioElementChange?.(null),
-        { once: true },
-      );
-      void audio.play();
-    }, [projectId, setAudio, onAudioElementChange]);
+
+      const url = projectFullAudioUrl(projectId, audioGeneratedAt);
+      let audio = audioRef.current;
+
+      if (!audio || boundFullAudioUrlRef.current !== url) {
+        if (audio) {
+          audio.pause();
+          audio.removeEventListener("ended", handleFullAudioEnded);
+        }
+        audio = new Audio(url);
+        boundFullAudioUrlRef.current = url;
+        audio.addEventListener("ended", handleFullAudioEnded);
+      }
+
+      const seekAndPlay = () => {
+        audio!.currentTime = Math.max(0, sec);
+        audioRef.current = audio!;
+        setAudio(audio!);
+        audio!.addEventListener(
+          "playing",
+          () => onAudioElementChange?.(audio!),
+          { once: true },
+        );
+        audio!.addEventListener(
+          "error",
+          () => onAudioElementChange?.(null),
+          { once: true },
+        );
+        void audio!.play();
+      };
+
+      if (audio.readyState >= 1) {
+        seekAndPlay();
+      } else {
+        audio.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+        audio.load();
+      }
+    }, [
+      projectId,
+      allScenes,
+      audioGeneratedAt,
+      setAudio,
+      onAudioElementChange,
+      handleFullAudioEnded,
+    ]);
+
+    // audioGeneratedAt / projectId 变化时丢弃旧 audio 元素
+    useEffect(() => {
+      const audio = audioRef.current;
+      if (!audio) return;
+      audio.pause();
+      audio.removeEventListener("ended", handleFullAudioEnded);
+      audioRef.current = null;
+      boundFullAudioUrlRef.current = null;
+      setAudio(null);
+    }, [audioGeneratedAt, projectId, handleFullAudioEnded, setAudio]);
 
     // 切到下一个分镜（叠化过渡）
     const advanceToNext = useCallback(() => {
       clearAll();
-      if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-      setAudio(null);
-
+      // 整片 mp3 连续播放，切镜时不暂停/重启音频
       if (currentIndex >= allScenes.length - 1) {
         isRunningRef.current = false;
         setIsPlaying(false);
@@ -268,58 +403,67 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       }, FADE_DURATION_MS);
     }, [currentIndex, allScenes, kenBurnsScale, clearAll, clearPrevLayer, recordingMode, onRecordingComplete]);
 
-    // 开始播放进度计时
+    // 开始播放进度：以整片 mp3 的 currentTime 为唯一时钟，驱动字幕与切镜
     const startProgress = useCallback(() => {
-      // 如果已经有 timer 在跑，不再启动新的
       if (isRunningRef.current) {
-        console.log("[startProgress] already running, skipping");
         return;
       }
       isRunningRef.current = true;
 
-      const sceneDuration = sceneDurations[allScenes[currentIndex]?.index] ?? DEFAULT_SCENE_DURATION;
       const countAtStart = ++progressCountRef.current;
-      startedIndexRef.current = currentIndex;
-      sceneElapsedRef.current = 0;
+      startedIndexRef.current = currentIndexRef.current;
       doneFiredRef.current = false;
-      console.log("[startProgress] sceneIndex=", currentIndex, "duration=", sceneDuration, "count=", countAtStart);
 
       clearAll();
 
-      // Ken Burns（updater 是纯函数，StrictMode 重放安全）
       kbTimerRef.current = setInterval(() => {
         setKenBurnsScale((prev) => Math.min(prev + 0.015, 1.15));
       }, 200);
 
-      // 进度计时：所有副作用都放在 setState 外，保证只执行一次
-      progressTimerRef.current = setInterval(() => {
-        // 丢弃：计数器过期 / 分镜已切换 / 已暂停 / 已触发过推进
+      const tick = () => {
         if (
           !isRunningRef.current ||
           doneFiredRef.current ||
-          countAtStart !== progressCountRef.current ||
-          startedIndexRef.current !== currentIndex
+          countAtStart !== progressCountRef.current
         ) {
           return;
         }
 
-        sceneElapsedRef.current = Math.min(sceneElapsedRef.current + 0.1, sceneDuration);
-        const elapsed = sceneElapsedRef.current;
+        const audio = audioRef.current;
+        const idx = currentIndexRef.current;
+        const sc = allScenes[idx];
+        if (!audio || !sc) return;
 
-        if (elapsed >= sceneDuration) {
-          // 注意：先翻 doneFiredRef，再做 set/clear/setTimeout，避免任何重入或 StrictMode 重放再次走进这里
+        const start = sceneStartSecRef.current[sc.index] ?? 0;
+        const dur = sceneDurations[sc.index] ?? DEFAULT_SCENE_DURATION;
+        const elapsed = audio.currentTime - start;
+
+        if (elapsed >= dur - 0.05) {
+          setCurrentTime(dur);
+          if (idx >= allScenes.length - 1) {
+            return;
+          }
           doneFiredRef.current = true;
           isRunningRef.current = false;
-          if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
-          if (kbTimerRef.current) { clearInterval(kbTimerRef.current); kbTimerRef.current = null; }
-          console.log("[progress] scene done, count=", countAtStart, "sceneIndex=", startedIndexRef.current, "calling advanceToNext");
-          setCurrentTime(sceneDuration);
+          if (progressTimerRef.current) {
+            clearInterval(progressTimerRef.current);
+            progressTimerRef.current = null;
+          }
+          if (kbTimerRef.current) {
+            clearInterval(kbTimerRef.current);
+            kbTimerRef.current = null;
+          }
           setTimeout(advanceToNext, 0);
-        } else {
-          setCurrentTime(elapsed);
+          return;
         }
-      }, 100);
-    }, [currentIndex, allScenes, sceneDurations, clearAll, advanceToNext]);
+
+        sceneElapsedRef.current = Math.max(0, elapsed);
+        setCurrentTime(sceneElapsedRef.current);
+      };
+
+      progressTimerRef.current = setInterval(tick, 50);
+      tick();
+    }, [allScenes, sceneDurations, clearAll, advanceToNext]);
 
     // 播放/暂停
     const togglePlay = useCallback(() => {
@@ -332,21 +476,20 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         if (allScenes.length === 0) return;
         setIsPlaying(true);
         const sc = allScenes[currentIndex];
-        if (sc) playAudio(sc);
+        if (sc) {
+          const startSec =
+            (sceneStartSecRef.current[sc.index] ?? 0) + sceneElapsedRef.current;
+          playFullAudioFrom(startSec);
+        }
         startProgress();
       }
-    }, [isPlaying, currentIndex, allScenes, playAudio, startProgress, clearAll]);
+    }, [isPlaying, currentIndex, allScenes, playFullAudioFrom, startProgress, clearAll]);
 
-    // 注：togglePlay 这里只暂停 audio 不置 null（用户可能再次点 play 续播），
-    // 所以不调 setAudio(null)。录屏模式下不暴露此按钮，无需通知 recorder。
-
-    // currentIndex 变化时：如果是自动播放中，重启进度和音频
+    // currentIndex 变化时：自动播放中只重启画面进度，不重启整片音频
     useEffect(() => {
       if (!isPlaying) return;
       clearAll();
       setKenBurnsScale(1);
-      const sc = allScenes[currentIndex];
-      if (sc) playAudio(sc);
       startProgress();
     }, [currentIndex]);
 
@@ -376,8 +519,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         return;
       }
       setIsPlaying(true);
-      const sc = allScenes[0];
-      if (sc) playAudio(sc);
+      playFullAudioFrom(0);
       startProgress();
       // 录屏模式不依赖 deps 重新触发，只在翻 true 时启动一次
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -422,6 +564,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setIsPlaying(false);
       setCurrentIndex(targetIdx);
       setCurrentTime(0);
+      sceneElapsedRef.current = 0;
       setKenBurnsScale(1);
       // 清理叠化层（避免带着上一个镜的残影进入新镜）
       if (fadeoutTimerRef.current) {
@@ -459,19 +602,28 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       const rect = e.currentTarget.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const targetSec = totalDuration * ratio;
-      let acc = 0, targetIdx = 0;
+      let acc = 0;
+      let targetIdx = 0;
+      let sceneOffset = 0;
       for (let i = 0; i < allScenes.length; i++) {
         const dur = sceneDurations[allScenes[i].index] ?? DEFAULT_SCENE_DURATION;
-        if (acc + dur >= targetSec) { targetIdx = i; break; }
+        if (acc + dur >= targetSec || i === allScenes.length - 1) {
+          targetIdx = i;
+          sceneOffset = Math.max(0, targetSec - acc);
+          break;
+        }
         acc += dur;
       }
       isRunningRef.current = false;
       clearAll();
-      if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-      setAudio(null);
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = targetSec;
+      }
       setIsPlaying(false);
       setCurrentIndex(targetIdx);
-      setCurrentTime(0);
+      setCurrentTime(sceneOffset);
+      sceneElapsedRef.current = sceneOffset;
       setKenBurnsScale(1);
       // 拖动跳转使用硬切（瞬时响应），不做叠化
       clearPrevLayer();

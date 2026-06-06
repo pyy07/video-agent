@@ -71,6 +71,11 @@ export function defaultTitleFor(type: ProjectType): string {
   return `未命名${PROJECT_TYPE_LABEL[type]}项目`;
 }
 
+/** 是否为新建项目时的默认标题（尚未手动命名） */
+export function isDefaultProjectTitle(title: string, type: ProjectType): boolean {
+  return title === defaultTitleFor(type);
+}
+
 function dataRoot(): string {
   const fromEnv = process.env.DATA_DIR?.trim();
   return fromEnv
@@ -388,6 +393,25 @@ export async function updateSceneAudioPath(
     throw new Error(`scene_index_invalid: ${sceneIndex}`);
   }
   scene.audioPath = audioPath;
+  await saveStoryboard(uuid, outline);
+}
+
+/** 批量更新各分镜 audioPath（整片录音切分后一次写入） */
+export async function updateAllSceneAudioPaths(
+  uuid: string,
+  paths: Record<number, string>,
+): Promise<void> {
+  const outline = await loadStoryboard(uuid);
+  if (!outline) {
+    throw new Error("outline_not_found");
+  }
+  for (const scene of outline.scenes) {
+    const next = paths[scene.index];
+    if (next) {
+      scene.audioPath = next;
+    }
+  }
+  outline.audioGeneratedAt = new Date().toISOString();
   await saveStoryboard(uuid, outline);
 }
 

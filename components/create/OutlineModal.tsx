@@ -9,7 +9,6 @@ import {
   Loader2,
   Pencil,
   Plus,
-  RefreshCw,
   Volume2,
   VolumeX,
   X,
@@ -18,14 +17,15 @@ import NextImage from "next/image";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   addSceneAction,
+  generateProjectAudiosAction,
   regenerateSceneHtmlAction,
   regenerateSceneImageAction,
-  regenerateSceneNarrationAction,
   updateSceneNarrationAction,
   updateScenePromptAction,
   updateSceneTitleAction,
 } from "@/app/actions";
 import { PROJECT_TYPE_LABEL } from "@/lib/projectTypes";
+import { projectAudioUrl } from "@/lib/audioUrl";
 import type { OutlineScene, VideoOutline } from "@/lib/outlineTypes";
 import { pickSceneCover } from "./sceneCover";
 
@@ -61,6 +61,27 @@ export function OutlineModal({
 
   // 全局只允许一个分镜的音频在播放：当某个卡片开始播时，关掉之前的
   const [playingIndex, setPlayingIndex] = useState<number | null>(null);
+  const [regeneratingAudio, setRegeneratingAudio] = useState(false);
+  const [audioError, setAudioError] = useState<string | null>(null);
+
+  const handleRegenerateAllAudio = useCallback(async () => {
+    if (!projectId || regeneratingAudio) return;
+    setPlayingIndex(null);
+    setAudioError(null);
+    setRegeneratingAudio(true);
+    try {
+      const res = await generateProjectAudiosAction(projectId);
+      if (!res.ok) {
+        setAudioError(res.error);
+      } else {
+        onOutlineUpdated?.(res.outline);
+      }
+    } catch (e) {
+      setAudioError(e instanceof Error ? e.message : "重新生成失败");
+    } finally {
+      setRegeneratingAudio(false);
+    }
+  }, [projectId, regeneratingAudio, onOutlineUpdated]);
 
   return (
     <div
@@ -92,6 +113,25 @@ export function OutlineModal({
             </span>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRegenerateAllAudio}
+              disabled={!projectId || regeneratingAudio || outline.scenes.length === 0}
+              title="整片旁白一次录音后切分到各分镜，会覆盖所有分镜音频"
+              className={clsx(
+                "inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs font-medium transition",
+                !projectId || regeneratingAudio || outline.scenes.length === 0
+                  ? "cursor-not-allowed border-ink-200 bg-ink-50 text-ink-400"
+                  : "border-ink-200 bg-white text-ink-700 hover:border-brand-300 hover:bg-brand-50 hover:text-brand-700",
+              )}
+            >
+              {regeneratingAudio ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Volume2 className="h-3.5 w-3.5" />
+              )}
+              {regeneratingAudio ? "正在合成音频…" : "重新生成音频"}
+            </button>
             <button
               type="button"
               onClick={() => setAddFormOpen((v) => !v)}
@@ -131,6 +171,12 @@ export function OutlineModal({
           />
         )}
 
+        {audioError && (
+          <div className="border-b border-amber-200 bg-amber-50/80 px-6 py-2 text-[12px] leading-relaxed text-amber-700">
+            {audioError}
+          </div>
+        )}
+
         <div className="flex-1 overflow-y-auto px-6 py-5">
           <ol className="space-y-4">
             {outline.scenes.map((scene) => (
@@ -139,6 +185,8 @@ export function OutlineModal({
                   scene={scene}
                   projectId={projectId}
                   mode={outline.mode}
+                  audioGeneratedAt={outline.audioGeneratedAt}
+                  audioRegenerating={regeneratingAudio}
                   isPlaying={playingIndex === scene.index}
                   onPlayingChange={(playing) =>
                     setPlayingIndex(playing ? scene.index : null)
@@ -162,17 +210,21 @@ type SceneCardProps = {
   scene: OutlineScene;
   projectId: string | null;
   mode: import("@/lib/projectTypes").ProjectType;
+  audioGeneratedAt?: string;
+  audioRegenerating?: boolean;
   isPlaying: boolean;
   onPlayingChange: (playing: boolean) => void;
   onOutlineUpdated?: (outline: VideoOutline) => void;
 };
 
-type RegenKind = "image" | "html" | "narration" | null;
+type RegenKind = "image" | "html" | null;
 
 function SceneCard({
   scene,
   projectId,
   mode,
+  audioGeneratedAt,
+  audioRegenerating = false,
   isPlaying,
   onPlayingChange,
   onOutlineUpdated,
@@ -197,8 +249,16 @@ function SceneCard({
       : null;
   const audioUrl =
     scene.audioPath && projectId
-      ? `/api/project-audio/${projectId}/${scene.index}.mp3?v=${imageNonce}`
+      ? projectAudioUrl(projectId, scene.index, audioGeneratedAt)
       : null;
+
+  // 音频版本变化时停止播放
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+  }, [audioUrl]);
 
   // 父级要求停止（别的卡片开始播了）→ 暂停自己的 audio
   useEffect(() => {
@@ -266,32 +326,6 @@ function SceneCard({
     }
   }, [projectId, regenerating, scene.index, isHtmlMode, onOutlineUpdated]);
 
-  const handleRegenerateNarration = useCallback(async () => {
-    if (!projectId || regenerating) return;
-    // narration 改了，audio 也会被服务端一起重生 → 停掉当前正在播的旧音频
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.currentTime = 0;
-    }
-    if (isPlaying) onPlayingChange(false);
-
-    setError(null);
-    setRegenerating("narration");
-    try {
-      const res = await regenerateSceneNarrationAction(projectId, scene.index);
-      if (!res.ok) {
-        setError(res.error);
-      } else {
-        setImageNonce((n) => n + 1); // 让 audio URL 也带新 nonce，避开浏览器缓存
-        onOutlineUpdated?.(res.outline);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "重新生成失败");
-    } finally {
-      setRegenerating(null);
-    }
-  }, [projectId, regenerating, scene.index, isPlaying, onPlayingChange, onOutlineUpdated]);
-
   /**
    * 手动编辑文本字段的统一入口：标题 / 旁白 / 画面提示词。
    * 调对应 action，把服务端最新 outline 推给父级，弹窗内部状态也随之刷新。
@@ -325,7 +359,7 @@ function SceneCard({
     [projectId, scene.index, onOutlineUpdated],
   );
 
-  const busy = regenerating !== null;
+  const busy = regenerating !== null || audioRegenerating;
 
   return (
     <article className="overflow-hidden rounded-2xl border border-ink-200/70 bg-white shadow-soft">
@@ -432,16 +466,8 @@ function SceneCard({
           />
 
           <div>
-            <div className="flex items-center justify-between">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-ink-400">
-                分镜旁白
-              </div>
-              {regenerating === "narration" && (
-                <span className="inline-flex items-center gap-1 text-[11px] text-brand-600">
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                  正在重写旁白…
-                </span>
-              )}
+            <div className="text-[11px] font-medium uppercase tracking-wide text-ink-400">
+              分镜旁白
             </div>
             <EditableField
               label="分镜旁白"
@@ -476,7 +502,7 @@ function SceneCard({
             </div>
           )}
 
-          {/* 重新生成按钮组 */}
+          {/* 重新生成按钮组（画面/动画按分镜；音频在弹窗顶部整片重生） */}
           <div className="flex flex-wrap items-center gap-2 pt-1">
             <button
               type="button"
@@ -497,24 +523,6 @@ function SceneCard({
                 <ImageIcon className="h-3.5 w-3.5" />
               )}
               {isHtmlMode ? "重新生成动画" : "重新生成画面"}
-            </button>
-            <button
-              type="button"
-              onClick={handleRegenerateNarration}
-              disabled={busy || !projectId}
-              className={clsx(
-                "inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition",
-                busy || !projectId
-                  ? "cursor-not-allowed border-ink-200 bg-ink-50 text-ink-400"
-                  : "border-ink-200 bg-white text-ink-700 hover:border-brand-300 hover:bg-brand-50 hover:text-brand-700",
-              )}
-            >
-              {regenerating === "narration" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3.5 w-3.5" />
-              )}
-              重新生成旁白
             </button>
           </div>
         </div>

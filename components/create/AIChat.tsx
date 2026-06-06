@@ -35,7 +35,11 @@ type AIChatProps = {
    * 已经生成的画面/音频和走再生流程。
    */
   liveOutline: VideoOutline | null;
-  onNewHistory: (messages: PersistedChatMessage[], outline?: VideoOutline) => void;
+  onNewHistory: (
+    messages: PersistedChatMessage[],
+    outline?: VideoOutline,
+    projectTitle?: string,
+  ) => void;
   /**
    * 打开大纲弹窗。AIChat 不再自己持有弹窗状态，由父级 CreatePageClient 统一管理。
    * `outline` 参数：消息里带的历史 outline（可能比 live outline 旧）。
@@ -99,7 +103,8 @@ export function AIChat({
       const result = await sendPromptAction(submittedFor, text);
       if (activeProjectIdRef.current !== submittedFor) return;
       const nextOutline = result.ok ? result.outline : undefined;
-      onNewHistory(result.messages, nextOutline);
+      const nextTitle = result.ok ? result.projectTitle : undefined;
+      onNewHistory(result.messages, nextOutline, nextTitle);
       if (!result.ok) {
         setToast(result.error);
       }

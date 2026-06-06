@@ -18,7 +18,8 @@ import {
   loadChatHistory,
   loadStoryboard,
   saveStoryboard,
-  updateSceneAudioPath,
+  isDefaultProjectTitle,
+  updateAllSceneAudioPaths,
   updateSceneHtmlPath,
   updateSceneImagePath,
   updateSceneNarration,
@@ -112,6 +113,8 @@ export type SendPromptResult =
       messages: PersistedChatMessage[];
       action: IntentAction;
       outline?: VideoOutline;
+      /** 首条提示词自动命名后返回的新项目名 */
+      projectTitle?: string;
     }
   | { ok: false; error: string; messages: PersistedChatMessage[] };
 
@@ -136,9 +139,10 @@ export async function sendPromptAction(
 
   // 0. 取项目模式（决定画面提示词风格、也是 INT 派发的 ctx 字段）
   let projectMode: ProjectType = "image";
+  let projectMeta: Awaited<ReturnType<typeof getProject>> = null;
   try {
-    const project = await getProject(projectId);
-    if (project) projectMode = project.type;
+    projectMeta = await getProject(projectId);
+    if (projectMeta) projectMode = projectMeta.type;
   } catch (err) {
     console.error(`[sendPromptAction] getProject failed for ${projectId}:`, err);
     // 拿不到模式不致命，丢一个默认 image
@@ -175,7 +179,25 @@ export async function sendPromptAction(
         content: m.content,
       })),
     });
-    const { action } = parseIntentResponse(raw);
+    const { action, projectTitle: suggestedTitle } = parseIntentResponse(raw);
+
+    // 首条提示词 + 仍为默认项目名 → 用意图分析给出的标题自动命名
+    const isFirstPrompt =
+      history.filter((m) => m.role === "user").length === 1;
+    let autoRenamedTitle: string | undefined;
+    if (
+      isFirstPrompt &&
+      suggestedTitle &&
+      projectMeta &&
+      isDefaultProjectTitle(projectMeta.title, projectMeta.type)
+    ) {
+      const renameRes = await renameProject(projectId, suggestedTitle);
+      if (renameRes.ok) {
+        autoRenamedTitle = renameRes.title;
+        revalidatePath("/create");
+      }
+    }
+
     const result = await handleIntent(action, {
       projectId,
       mode: projectMode,
@@ -210,6 +232,7 @@ export async function sendPromptAction(
       messages: finalHistory,
       action,
       outline: result.kind === "outline" ? result.outline : undefined,
+      projectTitle: autoRenamedTitle,
     };
   } catch (err) {
     const rawMessage = err instanceof Error ? err.message : String(err);
@@ -487,20 +510,6 @@ export async function generateSceneImageAction(
     });
     await updateSceneImagePath(projectId, sceneIndex, result.relativePath);
 
-    // 生成完图片后，自动生成旁白音频
-    try {
-      const { generateAudio } = await import("@/lib/audioGen");
-      const audioResult = await generateAudio({
-        projectId,
-        sceneIndex,
-        narration: scene.narration,
-      });
-      await updateSceneAudioPath(projectId, sceneIndex, audioResult.relativePath);
-    } catch (audioErr) {
-      // 音频生成失败不中止整个流程，只打印日志
-      console.error(`[generateSceneImageAction] scene ${sceneIndex} audio failed:`, audioErr instanceof Error ? audioErr.message : String(audioErr));
-    }
-
     return { ok: true, sceneIndex, imagePath: result.relativePath };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -555,40 +564,61 @@ export async function regenerateSceneImageAction(
 }
 
 /**
- * 仅重新生成音频（沿用当前 narration，不动 image / narration）。
- * 用于"重新合成旁白音频"等场景；目前 UI 没直接暴露这个按钮，
- * 但 regenerateSceneNarrationAction 会在 narration 改写完后内部调用同样的逻辑。
+ * 整片旁白一次 TTS 录音，再按字数比例切分到各分镜。
+ * 任意触发「生成/重生成音频」都应走此路径，以保证全片语调一致。
  */
-export async function regenerateSceneAudioAction(
+async function regenerateProjectAudios(
   projectId: string,
-  sceneIndex: number,
 ): Promise<RegenerateSceneResult> {
-  if (!UUID_RE.test(projectId)) return { ok: false, error: "无效的项目 ID" };
-  if (!Number.isInteger(sceneIndex) || sceneIndex < 1) {
-    return { ok: false, error: "无效的分镜序号" };
-  }
-
   const outline = await loadStoryboard(projectId);
   if (!outline) return { ok: false, error: "大纲不存在" };
-  const scene = outline.scenes.find((s) => s.index === sceneIndex);
-  if (!scene) return { ok: false, error: `分镜 ${sceneIndex} 不存在` };
+  if (outline.scenes.length === 0) {
+    return { ok: false, error: "大纲中没有分镜" };
+  }
 
   try {
-    const { generateAudio } = await import("@/lib/audioGen");
-    const result = await generateAudio({
+    const { generateProjectAudios } = await import("@/lib/audioGen");
+    const result = await generateProjectAudios({
       projectId,
-      sceneIndex,
-      narration: scene.narration,
+      scenes: outline.scenes,
     });
-    await updateSceneAudioPath(projectId, sceneIndex, result.relativePath);
+    await updateAllSceneAudioPaths(projectId, result.scenePaths);
     const fresh = await loadStoryboard(projectId);
     if (!fresh) return { ok: false, error: "刷新大纲失败" };
     return { ok: true, outline: fresh };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[regenerateSceneAudioAction] scene ${sceneIndex} failed:`, msg);
+    console.error(`[regenerateProjectAudios] failed for ${projectId}:`, msg);
     return { ok: false, error: msg };
   }
+}
+
+export async function generateProjectAudiosAction(
+  projectId: string,
+): Promise<RegenerateSceneResult> {
+  if (!UUID_RE.test(projectId)) return { ok: false, error: "无效的项目 ID" };
+  return regenerateProjectAudios(projectId);
+}
+
+/**
+ * 仅重新生成音频（沿用当前各镜 narration，整片录音后切分）。
+ */
+export async function regenerateSceneAudioAction(
+  projectId: string,
+  _sceneIndex: number,
+): Promise<RegenerateSceneResult> {
+  if (!UUID_RE.test(projectId)) return { ok: false, error: "无效的项目 ID" };
+  if (!Number.isInteger(_sceneIndex) || _sceneIndex < 1) {
+    return { ok: false, error: "无效的分镜序号" };
+  }
+
+  const outline = await loadStoryboard(projectId);
+  if (!outline) return { ok: false, error: "大纲不存在" };
+  if (!outline.scenes.some((s) => s.index === _sceneIndex)) {
+    return { ok: false, error: `分镜 ${_sceneIndex} 不存在` };
+  }
+
+  return regenerateProjectAudios(projectId);
 }
 
 /**
@@ -644,17 +674,16 @@ export async function regenerateSceneNarrationAction(
     // Step 2: 落盘 narration
     await updateSceneNarration(projectId, sceneIndex, newNarration);
 
-    // Step 3: 重生 audio
+    // Step 3: 整片重生 audio（旁白改动后各镜切分点一起更新）
     try {
-      const { generateAudio } = await import("@/lib/audioGen");
-      const audioResult = await generateAudio({
-        projectId,
-        sceneIndex,
-        narration: newNarration,
-      });
-      await updateSceneAudioPath(projectId, sceneIndex, audioResult.relativePath);
+      const audioRes = await regenerateProjectAudios(projectId);
+      if (!audioRes.ok) {
+        console.error(
+          `[regenerateSceneNarrationAction] project audio failed for scene ${sceneIndex}:`,
+          audioRes.error,
+        );
+      }
     } catch (audioErr) {
-      // 音频失败不回滚 narration（用户至少看到了新文本，可以稍后手动再生音频）
       console.error(
         `[regenerateSceneNarrationAction] audio failed for scene ${sceneIndex}:`,
         audioErr instanceof Error ? audioErr.message : String(audioErr),
@@ -677,7 +706,7 @@ export async function regenerateSceneNarrationAction(
  *  - updateSceneTitleAction   —— 仅改 title
  *  - updateScenePromptAction  —— 仅改 prompt
  *  - updateSceneNarrationAction —— 仅改 narration（不自动重生成 audio，避免误伤现有素材；
- *                                 用户改完旁白后想同步音频可点"重新生成旁白"按钮）
+ *                                 用户改完旁白后想同步音频可点「重新生成音频」按钮）
  *
  * 全部走"原子写 storyboard + revalidatePath"，刷新后用户看到最新数据。
  * ------------------------------------------------------------------------- */
@@ -886,22 +915,6 @@ export async function generateSceneHtmlAction(
     });
     await updateSceneHtmlPath(projectId, sceneIndex, result.relativePath);
 
-    // 自动生成旁白音频（与图片模式一致的体验）
-    try {
-      const { generateAudio } = await import("@/lib/audioGen");
-      const audioResult = await generateAudio({
-        projectId,
-        sceneIndex,
-        narration: scene.narration,
-      });
-      await updateSceneAudioPath(projectId, sceneIndex, audioResult.relativePath);
-    } catch (audioErr) {
-      console.error(
-        `[generateSceneHtmlAction] audio failed for scene ${sceneIndex}:`,
-        audioErr instanceof Error ? audioErr.message : String(audioErr),
-      );
-    }
-
     return { ok: true, sceneIndex, htmlPath: result.relativePath };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1032,15 +1045,8 @@ export async function regenerateSceneHtmlAction(
     });
     await updateSceneHtmlPath(projectId, sceneIndex, result.relativePath);
 
-    // 重生音频（保持同步）
     try {
-      const { generateAudio } = await import("@/lib/audioGen");
-      const audioResult = await generateAudio({
-        projectId,
-        sceneIndex,
-        narration: scene.narration,
-      });
-      await updateSceneAudioPath(projectId, sceneIndex, audioResult.relativePath);
+      await regenerateProjectAudios(projectId);
     } catch (audioErr) {
       console.error(
         `[regenerateSceneHtmlAction] audio failed for scene ${sceneIndex}:`,

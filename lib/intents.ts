@@ -23,6 +23,8 @@ export type IntentAction = (typeof INTENT_ACTIONS)[number];
 export interface IntentResult {
   action: IntentAction;
   reason: string;
+  /** 根据用户描述拟定的项目名（仅首次创作主题时由 LLM 给出） */
+  projectTitle?: string;
 }
 
 /** handler 拿到的运行时上下文 */
@@ -74,9 +76,20 @@ export function parseIntentResponse(raw: string): IntentResult {
   if (typeof reason !== "string") {
     throw new Error("shape_invalid: reason is not a string");
   }
+  let projectTitle: string | undefined;
+  if (obj.projectTitle !== undefined) {
+    if (typeof obj.projectTitle !== "string") {
+      throw new Error("shape_invalid: projectTitle is not a string");
+    }
+    const trimmedTitle = obj.projectTitle.trim();
+    if (trimmedTitle.length > 0) {
+      projectTitle = trimmedTitle.slice(0, 80);
+    }
+  }
   return {
     action: action as IntentAction,
     reason: reason.slice(0, 500),
+    projectTitle,
   };
 }
 
@@ -111,6 +124,10 @@ export const INTENT_SYSTEM_PROMPT = `你是 AI 视频创作助手的意图识别
 # 返回 JSON 格式
 {"action": "<六种 action 之一>", "reason": "用一句话向用户解释为什么识别为该意图"}
 
+# 可选字段 projectTitle
+当用户首次描述要创作的视频主题（尤其是 action 为 generate_video_outline），同时给项目起一个简洁的中文名（4~20 字），概括视频主题。不要书名号、不要「项目」二字后缀。
+若用户只是在操作已有大纲（增删改镜）、重新生成、或闲聊问答，则不要输出 projectTitle 字段。
+
 # 示例
 输入：帮我做一个关于宇宙探索的科普视频，时长大约 1 分钟
-输出：{"action": "generate_video_outline", "reason": "用户希望从零开始创作一个完整的视频"}`;
+输出：{"action": "generate_video_outline", "reason": "用户希望从零开始创作一个完整的视频", "projectTitle": "宇宙探索科普"}`;

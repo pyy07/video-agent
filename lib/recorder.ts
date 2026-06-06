@@ -175,6 +175,8 @@ export async function startRecordingFromCanvas(
   let audioStopped = false;
   let audioPumpPromise: Promise<void> = Promise.resolve();
   let audioChunkCount = 0;
+  /** 已 createMediaElementSource 绑定的元素（同一元素不可重复绑定） */
+  let connectedAudioEl: HTMLAudioElement | null = null;
 
   const startAudioPumpFor = (audioTrack: MediaStreamTrack) => {
     audioProcessor = new MediaStreamTrackProcessor({ track: audioTrack });
@@ -230,6 +232,7 @@ export async function startRecordingFromCanvas(
       try { elementSource.disconnect(); } catch { /* ignore */ }
       elementSource = null;
     }
+    connectedAudioEl = null;
   };
 
   if (withAudio) {
@@ -263,14 +266,26 @@ export async function startRecordingFromCanvas(
 
   const setAudioElement = (audioEl: HTMLAudioElement | null) => {
     if (!withAudio || !audioContext || !mediaDest) return;
+
+    if (!audioEl) {
+      disconnectElementSource();
+      return;
+    }
+
+    // 整片 mp3 连续播放时会多次回调同一 <audio>，不可重复 createMediaElementSource
+    if (connectedAudioEl === audioEl && elementSource) {
+      void audioContext.resume();
+      return;
+    }
+
     disconnectElementSource();
-    if (!audioEl) return;
 
     void audioContext.resume().then(() => {
       try {
         elementSource = audioContext!.createMediaElementSource(audioEl);
         elementSource.connect(mediaDest!);
         elementSource.connect(audioContext!.destination);
+        connectedAudioEl = audioEl;
       } catch (e) {
         console.error("[recorder] createMediaElementSource failed:", e);
       }

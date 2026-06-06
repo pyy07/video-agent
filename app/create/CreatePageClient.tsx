@@ -17,6 +17,7 @@ import {
 import { WORKSPACE_BOTTOM_DOCK_HEIGHT, WORKSPACE_HEADER_HEIGHT } from "@/lib/workspaceLayout";
 import {
   deleteProjectAction,
+  generateProjectAudiosAction,
   getChatHistoryAction,
   loadStoryboardAction,
   regenerateSceneAudioAction,
@@ -164,11 +165,24 @@ export default function CreatePageClient({
 
   // 接收 AIChat 的回调：更新历史；如果 action 返回了 outline，刷新大纲
   const handleNewHistory = useCallback(
-    (messages: PersistedChatMessage[], nextOutline?: VideoOutline) => {
+    (
+      messages: PersistedChatMessage[],
+      nextOutline?: VideoOutline,
+      renamedProjectTitle?: string,
+    ) => {
       setChatHistory(messages);
       if (nextOutline) setOutline(nextOutline);
+      if (renamedProjectTitle && activeProjectId) {
+        setProjects((list) =>
+          list.map((p) =>
+            p.uuid === activeProjectId
+              ? { ...p, title: renamedProjectTitle }
+              : p,
+          ),
+        );
+      }
     },
-    [],
+    [activeProjectId],
   );
 
   /**
@@ -239,9 +253,9 @@ export default function CreatePageClient({
    *
    * 设计要点：
    *  - 客户端编排，逐镜串行（避免并发把 LLM/图片/音频服务打爆）
-   *  - image 模式：任务以「画面」「音频」为粒度计数
-   *  - html 模式：任务以「动画」「音频」为粒度计数
-   *  - 同一镜如果两样都缺，算 2 个任务
+   *  - image 模式：先逐镜补画面，最后整片生成音频并切分
+   *  - html 模式：任务以「动画」为粒度；音频在全部视觉任务完成后整片生成一次
+   *  - 若存在缺失音频，最后追加 1 个整片音频任务（一次 TTS + 切分）
    *  - 每完成一项就 setOutline，UI 立即反映进度
    *  - generatingSceneIndex 同时被点亮，复用现有单镜"生成中…"卡片样式
    *  - 再次点击按钮（bulkProgress 非空时）触发中断，下一镜不再开始
@@ -262,39 +276,35 @@ export default function CreatePageClient({
     if (fresh0.ok) setOutline(fresh0.outline);
 
     const isHtmlMode = baseOutline?.mode === "html";
-    type Task = { sceneIndex: number; kind: "visual" | "audio" };
+    type Task = { sceneIndex: number; kind: "visual" };
     const tasks: Task[] = [];
     for (const sc of baseScenes) {
       if (isHtmlMode) {
         if (!sc.htmlPath) tasks.push({ sceneIndex: sc.index, kind: "visual" });
-      } else {
-        if (!sc.imagePath) tasks.push({ sceneIndex: sc.index, kind: "visual" });
+      } else if (!sc.imagePath) {
+        tasks.push({ sceneIndex: sc.index, kind: "visual" });
       }
-      if (!sc.audioPath) tasks.push({ sceneIndex: sc.index, kind: "audio" });
     }
-    if (tasks.length === 0) return; // 全部都已生成
+    const needsProjectAudio = baseScenes.some((sc) => !sc.audioPath);
+    const totalTasks = tasks.length + (needsProjectAudio ? 1 : 0);
+    if (totalTasks === 0) return;
 
     bulkAbortRef.current = false;
-    setBulkProgress({ current: 0, total: tasks.length });
+    setBulkProgress({ current: 0, total: totalTasks });
 
     for (let i = 0; i < tasks.length; i++) {
       if (bulkAbortRef.current) break;
       const t = tasks[i];
-      setBulkProgress({ current: i + 1, total: tasks.length });
+      setBulkProgress({ current: i + 1, total: totalTasks });
       setGeneratingSceneIndex(t.sceneIndex);
       try {
         let res;
-        if (t.kind === "audio") {
-          res = await regenerateSceneAudioAction(activeProjectId, t.sceneIndex);
-        } else if (isHtmlMode) {
+        if (isHtmlMode) {
           const { generateSceneHtmlAction } = await import("@/app/actions");
           res = await generateSceneHtmlAction(activeProjectId, t.sceneIndex);
-          // generateSceneHtmlAction 不返回 outline；成功后拉一次最新 outline
           if (res.ok) {
             const fresh = await loadStoryboardAction(activeProjectId);
-            if (fresh.ok) {
-              setOutline(fresh.outline);
-            }
+            if (fresh.ok) setOutline(fresh.outline);
             continue;
           }
         } else {
@@ -303,10 +313,25 @@ export default function CreatePageClient({
         if (res.ok && "outline" in res && res.outline) {
           setOutline(res.outline);
         } else if (!res.ok) {
-          console.error(`[bulkGenerate] ${t.kind} scene ${t.sceneIndex} failed:`, res.error);
+          console.error(`[bulkGenerate] visual scene ${t.sceneIndex} failed:`, res.error);
         }
       } catch (err) {
-        console.error(`[bulkGenerate] ${t.kind} scene ${t.sceneIndex} threw:`, err);
+        console.error(`[bulkGenerate] visual scene ${t.sceneIndex} threw:`, err);
+      }
+    }
+
+    if (!bulkAbortRef.current && needsProjectAudio) {
+      setBulkProgress({ current: tasks.length + 1, total: totalTasks });
+      setGeneratingSceneIndex(null);
+      try {
+        const res = await generateProjectAudiosAction(activeProjectId);
+        if (res.ok) {
+          setOutline(res.outline);
+        } else {
+          console.error("[bulkGenerate] project audio failed:", res.error);
+        }
+      } catch (err) {
+        console.error("[bulkGenerate] project audio threw:", err);
       }
     }
 
@@ -598,6 +623,7 @@ export default function CreatePageClient({
               showSubtitle={subtitleOn}
               projectId={activeProjectId}
               allScenes={scenes}
+              audioGeneratedAt={outline.audioGeneratedAt}
               projectType={projectType}
               recordingMode
               recordingCaptureReady={recordingCaptureReady}
@@ -633,7 +659,11 @@ function SplitWorkspace(props: {
   chatHistory: PersistedChatMessage[];
   chatLoading: boolean;
   liveOutline: VideoOutline | null;
-  onNewHistory: (messages: PersistedChatMessage[], outline?: VideoOutline) => void;
+  onNewHistory: (
+    messages: PersistedChatMessage[],
+    outline?: VideoOutline,
+    projectTitle?: string,
+  ) => void;
   generatingSceneIndex: number | null;
   onGenerateScene: (sceneIndex: number) => void;
   bulkProgress: { current: number; total: number } | null;
@@ -792,6 +822,7 @@ function SplitWorkspace(props: {
                     showSubtitle={props.subtitleOn}
                     projectId={props.projectId}
                     allScenes={props.scenes}
+                    audioGeneratedAt={props.liveOutline?.audioGeneratedAt}
                     projectType={props.projectType}
                     recordingMode={false}
                     onRecordingComplete={props.onRecordingComplete}
@@ -820,6 +851,7 @@ function SplitWorkspace(props: {
                   bulkProgress={props.bulkProgress}
                   onBulkGenerate={props.onBulkGenerate}
                   onOpenOutlineModal={props.onOpenOutlineModal}
+                  audioGeneratedAt={props.liveOutline?.audioGeneratedAt}
                 />
               </div>
             </div>

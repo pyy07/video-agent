@@ -15,6 +15,8 @@ const PROJECT_DATA_IGNORED = new RegExp(`^${escapedProjectDataDir}(?:/|$)`);
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // 含原生二进制的包不能被打进 .next 分包，否则 spawn 路径会错
+  serverExternalPackages: ["ffmpeg-static", "music-metadata"],
   webpack(config, { dev }) {
     if (dev) {
       config.watchOptions = {

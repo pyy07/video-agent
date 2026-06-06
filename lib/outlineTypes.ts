@@ -47,4 +47,6 @@ export interface VideoOutline {
   scenes: OutlineScene[];
   /** ISO 字符串 */
   generatedAt: string;
+  /** 最近一次整片音频生成时间（ISO），用于前端 cache bust */
+  audioGeneratedAt?: string;
 }

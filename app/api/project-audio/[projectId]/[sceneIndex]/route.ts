@@ -24,12 +24,20 @@ export async function GET(
 
   // 去掉扩展名（如 "1.mp3" -> "1"）
   const cleanIndex = sceneIndex.replace(/\.[^.]+$/, "");
-  const sceneIndexNum = Number(cleanIndex);
-  if (!Number.isInteger(sceneIndexNum) || sceneIndexNum < 1) {
+  const filePath =
+    cleanIndex === "full"
+      ? path.join(dataRoot(), projectId, "audio", "full.mp3")
+      : (() => {
+          const sceneIndexNum = Number(cleanIndex);
+          if (!Number.isInteger(sceneIndexNum) || sceneIndexNum < 1) {
+            return null;
+          }
+          return path.join(dataRoot(), projectId, "audio", `${sceneIndexNum}.mp3`);
+        })();
+
+  if (!filePath) {
     return new Response("Invalid scene index", { status: 400 });
   }
-
-  const filePath = path.join(dataRoot(), projectId, "audio", `${sceneIndexNum}.mp3`);
 
   try {
     // mtime + size ETag：重写旁白后音频文件被覆盖，浏览器自动拉新版本。
@@ -44,7 +52,7 @@ export async function GET(
         headers: {
           ETag: etag,
           "Last-Modified": lastModified,
-          "Cache-Control": "no-cache, must-revalidate",
+          "Cache-Control": "no-store",
         },
       });
     }
@@ -53,7 +61,7 @@ export async function GET(
     return new Response(buffer, {
       headers: {
         "Content-Type": "audio/mpeg",
-        "Cache-Control": "no-cache, must-revalidate",
+        "Cache-Control": "no-store",
         ETag: etag,
         "Last-Modified": lastModified,
       },
