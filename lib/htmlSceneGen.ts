@@ -28,6 +28,11 @@ const HTML_SYSTEM_PROMPT = `你是一个网页动画视频设计工程师。
 # 你的任务
 根据「目标分镜」的标题、旁白、画面提示词，输出一个完整、可直接运行的 HTML 页面（包含 <!DOCTYPE html>、<html>、<head>、<body>、内联 <style> 与 <script>），用来承载这一个分镜的网页动画。动画会被嵌入到视频播放器中自动循环播放，配合旁白音频。
 
+# 内容对齐（最重要）
+- 动画必须**可视化旁白正在讲的内容**：旁白提到的对象、过程、对比、比喻，都应在画面中有对应元素
+- 若旁白在解释抽象概念，用图标/流程/标签/箭头/数字等辅助理解，不要只做无关背景特效
+- 画面提示词与旁白冲突时，以**旁白语义**为准
+
 # 输出要求
 1. **必须是完整 HTML 页面**：以 <!DOCTYPE html> 开头，以 </html> 结尾，包含 head 和 body
 2. **动画技术**：用 HTML + CSS（@keyframes / transition / transform / animation）+ JS（setTimeout / requestAnimationFrame / Web Animations API）+ SVG / Canvas。多种技术可以组合使用
@@ -76,6 +81,7 @@ export async function generateSceneHtml(
   parts.push(`标题：${scene.title}`);
   parts.push(`旁白：${scene.narration}`);
   parts.push(`画面提示词（网页动画规格）：${scene.prompt}`);
+  parts.push(`内容对齐：动画必须直接可视化旁白中的核心概念，不要跑题。`);
   parts.push("");
   if (previousHtml && previousIndex != null) {
     parts.push(`# 上一镜 HTML 参考（第 ${previousIndex} 镜）`);

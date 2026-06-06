@@ -27,7 +27,27 @@ function getAudioConfig() {
 
 function resolveVoice(): string {
   const fromEnv = process.env.AUDIO_VOICE?.trim();
-  return fromEnv && fromEnv.length > 0 ? fromEnv : "nova";
+  return fromEnv && fromEnv.length > 0 ? fromEnv : "shimmer";
+}
+
+/** 全片统一的 TTS 语气指令，避免各分镜语调漂移 */
+function resolveAudioInstructions(): string {
+  const fromEnv = process.env.AUDIO_INSTRUCTIONS?.trim();
+  if (fromEnv) return fromEnv;
+  return [
+    "用标准、自然、平稳的普通话说出以下旁白。",
+    "保持全片一致的音色、语速和情绪：专业清晰的讲解风格，像同一位解说员在连续录音。",
+    "不要戏剧化，不要忽快忽慢，不要突然切换语气。",
+    "遇到专业术语时读得稍慢、吐字清楚。",
+  ].join("");
+}
+
+function resolveAudioSpeed(): number {
+  const raw = process.env.AUDIO_SPEED?.trim();
+  if (!raw) return 1;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0.25 || n > 4) return 1;
+  return n;
 }
 
 /* ---------------------------------------------------------------------------
@@ -72,6 +92,8 @@ export async function generateAudio(
 
   const { baseURL, apiKey } = getAudioConfig();
   const voice = resolveVoice();
+  const instructions = resolveAudioInstructions();
+  const speed = resolveAudioSpeed();
 
   const audioDir = projectAudioDir(projectId);
   await mkdir(audioDir, { recursive: true });
@@ -91,6 +113,8 @@ export async function generateAudio(
       model: "gpt-4o-mini-tts",
       input: narration,
       voice,
+      instructions,
+      speed,
       response_format: "mp3",
     }),
   });
