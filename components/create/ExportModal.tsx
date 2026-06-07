@@ -3,36 +3,35 @@
 import clsx from "clsx";
 import { CircleAlert, Film, Loader2, MonitorUp, ShieldCheck, Sparkles, X } from "lucide-react";
 import { useEffect, useState } from "react";
+import type { ProjectType } from "@/lib/projectTypes";
+import { PROJECT_TYPE_LABEL } from "@/lib/projectTypes";
 
 type ExportModalProps = {
   open: boolean;
   onClose: () => void;
-  /**
-   * 用户点击「开始录制」时调用。父级会切到全屏录制覆盖层、自动播放所有分镜、开始编码。
-   * resolve() = 成功；reject(err) = 启动失败（如 canvas 未就绪），由弹窗显示错误。
-   */
   onStart: () => Promise<void>;
-  /** 总分镜数（弹窗文案展示用） */
   sceneCount: number;
+  projectType: ProjectType;
 };
 
 type Phase = "ready" | "starting" | "error";
 
 /**
- * 视频导出弹窗（v2：canvas 录制，无系统 picker）。
- *
- * 流程：
- *  1. 用户在 Toolbar 点「视频导出」→ 父级控制 open=true
- *  2. 这个弹窗显示"录制流程"教学
- *  3. 用户点"开始录制" → 父级创建 recorder（基于 canvas）+ 切全屏 + 切录屏模式
- *  4. VideoPreview 从头播放所有分镜；canvas 渲染循环把每帧画到录制画布
- *  5. 播完触发 onRecordingComplete → finalize → 下载 MP4
+ * 视频导出弹窗。
+ * - 图片轮播：隐藏 canvas 逐帧编码，无系统弹窗
+ * - HTML 视频：getDisplayMedia 采集预览区（需允许共享当前标签页）
  */
-export function ExportModal({ open, onClose, onStart, sceneCount }: ExportModalProps) {
+export function ExportModal({
+  open,
+  onClose,
+  onStart,
+  sceneCount,
+  projectType,
+}: ExportModalProps) {
   const [phase, setPhase] = useState<Phase>("ready");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const isHtml = projectType === "html";
 
-  // 弹窗关闭时重置
   useEffect(() => {
     if (!open) {
       setPhase("ready");
@@ -40,7 +39,6 @@ export function ExportModal({ open, onClose, onStart, sceneCount }: ExportModalP
     }
   }, [open]);
 
-  // ESC 关闭（启动中不允许）
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -57,7 +55,6 @@ export function ExportModal({ open, onClose, onStart, sceneCount }: ExportModalP
     setErrorMsg(null);
     try {
       await onStart();
-      // 成功：父级会自己关弹窗。这里不要做清理。
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setPhase("error");
@@ -81,14 +78,11 @@ export function ExportModal({ open, onClose, onStart, sceneCount }: ExportModalP
         <header className="flex items-center justify-between border-b border-ink-200/70 px-5 py-3.5">
           <div className="flex items-center gap-2">
             <MonitorUp className="h-4 w-4 text-brand-500" />
-            <h2
-              id="export-modal-title"
-              className="text-sm font-semibold text-ink-900"
-            >
+            <h2 id="export-modal-title" className="text-sm font-semibold text-ink-900">
               导出视频
             </h2>
             <span className="rounded-md bg-ink-50 px-2 py-0.5 text-[11px] font-medium text-ink-600">
-              共 {sceneCount} 个分镜
+              {PROJECT_TYPE_LABEL[projectType]} · {sceneCount} 镜
             </span>
           </div>
           <button
@@ -103,31 +97,56 @@ export function ExportModal({ open, onClose, onStart, sceneCount }: ExportModalP
         </header>
 
         <div className="space-y-4 px-5 py-4">
+          {isHtml ? (
+            <>
+              <Step
+                n={1}
+                title="允许共享当前标签页"
+                desc={
+                  <>
+                    点击开始后，浏览器会弹出共享提示，请选择<b>当前标签页</b>并点「共享」。
+                    HTML 动画将按预览效果直接录制，支持 SVG、filter、drop-shadow 等全部 CSS 效果。
+                  </>
+                }
+                icon={<MonitorUp className="h-3.5 w-3.5" />}
+              />
+              <Step
+                n={2}
+                title="全屏自动播放"
+                desc={
+                  <>
+                    共享成功后预览会全屏播放所有分镜。
+                    <b className="text-amber-600">录制期间不要切换标签页</b>，否则画面会暂停。
+                  </>
+                }
+                icon={<Sparkles className="h-3.5 w-3.5" />}
+              />
+            </>
+          ) : (
+            <>
+              <Step
+                n={1}
+                title="点开始录制"
+                desc={
+                  <>
+                    点击下方按钮，预览会全屏并从第一镜自动播放。
+                    图片轮播在后台 canvas 合成，无需系统弹窗。
+                  </>
+                }
+                icon={<Sparkles className="h-3.5 w-3.5" />}
+              />
+              <Step
+                n={2}
+                title="录制中可取消"
+                desc="录制中右上角有 ✕ 可随时中止；不操作则自动播完。"
+                icon={<Film className="h-3.5 w-3.5" />}
+              />
+            </>
+          )}
           <Step
-            n={1}
-            title="点开始录制"
-            desc={
-              <>
-                点击下方按钮，<b>视频预览会自动全屏</b>并从第一个分镜开始自动播放，
-                <b className="text-amber-600">不要中途切换标签页</b>，否则录屏会暂停。
-              </>
-            }
-            icon={<Sparkles className="h-3.5 w-3.5" />}
-          />
-          <Step
-            n={2}
-            title="录制中可取消"
-            desc={
-              <>
-                录制中预览右上角有 <b>✕</b> 按钮，随时中止；不点就让它自动播完。
-              </>
-            }
-            icon={<Film className="h-3.5 w-3.5" />}
-          />
-          <Step
-            n={3}
+            n={isHtml ? 3 : 3}
             title="播完自动下载"
-            desc="所有分镜播完后，浏览器会自动下载 H.264 MP4 文件到默认下载目录。"
+            desc="所有分镜播完后，浏览器会自动下载 H.264 MP4 到默认下载目录。"
             icon={<ShieldCheck className="h-3.5 w-3.5" />}
           />
 
@@ -146,7 +165,7 @@ export function ExportModal({ open, onClose, onStart, sceneCount }: ExportModalP
 
         <footer className="flex items-center justify-between gap-3 border-t border-ink-200/70 bg-ink-50/40 px-5 py-3">
           <p className="text-[11px] text-ink-500">
-            录屏功能基于 WebCodecs + mp4-muxer，纯浏览器内编码，零上传。
+            WebCodecs + mp4-muxer，纯浏览器内编码。
           </p>
           <div className="flex items-center gap-2">
             <button

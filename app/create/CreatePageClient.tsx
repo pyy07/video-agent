@@ -12,6 +12,7 @@ import { ExportModal } from "@/components/create/ExportModal";
 import {
   downloadBlob,
   startRecordingFromCanvas,
+  startRecordingFromDisplayMedia,
   type RecordingHandle,
 } from "@/lib/recorder";
 import { WORKSPACE_BOTTOM_DOCK_HEIGHT, WORKSPACE_HEADER_HEIGHT } from "@/lib/workspaceLayout";
@@ -413,11 +414,12 @@ export default function CreatePageClient({
     setExportModalOpen(true);
   }, [outline]);
 
+  const projectType = project?.type ?? mode;
+
   /**
    * 弹窗点"开始录制"：
-   *  1. 先切 recordingMode，挂载全屏 VideoPreview（带录制 canvas）
-   *  2. 等 canvas 就绪后启动 recorder（必须抓全屏实例的 canvas，不能抓旧实例）
-   *  3. recorder 就绪后再允许自动播放
+   *  - 图片轮播：隐藏 canvas 编码
+   *  - HTML 视频：getDisplayMedia 采集预览区
    */
   const handleStartExport = useCallback(async (): Promise<void> => {
     setExportError(null);
@@ -425,26 +427,42 @@ export default function CreatePageClient({
     setRecordingCaptureReady(false);
     setRecordingMode(true);
 
+    const isHtmlProject = projectType === "html";
+
     try {
-      // 等 React commit + 全屏 VideoPreview 挂上 canvas
       await new Promise<void>((resolve) => {
         requestAnimationFrame(() => {
           requestAnimationFrame(() => resolve());
         });
       });
 
-      const canvas = videoPreviewRef.current?.getRecordingCanvas();
-      if (!canvas) {
-        throw new Error("录制画布尚未就绪，请稍后再试。");
+      let handle: RecordingHandle;
+
+      if (isHtmlProject) {
+        const region = videoPreviewRef.current?.getCaptureRegion();
+        if (!region) {
+          throw new Error("预览区域尚未就绪，请稍后再试。");
+        }
+        handle = await startRecordingFromDisplayMedia(region, {
+          frameRate: 30,
+          videoBitrate: 5_000_000,
+          withAudio: true,
+        });
+        recordingFrameBridgeRef.current = null;
+      } else {
+        const canvas = videoPreviewRef.current?.getRecordingCanvas();
+        if (!canvas) {
+          throw new Error("录制画布尚未就绪，请稍后再试。");
+        }
+        handle = await startRecordingFromCanvas(canvas, {
+          frameRate: 30,
+          videoBitrate: 5_000_000,
+          withAudio: true,
+        });
+        recordingFrameBridgeRef.current = () => handle.notifyFrameDrawn();
       }
 
-      const handle = await startRecordingFromCanvas(canvas, {
-        frameRate: 30,
-        videoBitrate: 5_000_000,
-        withAudio: true,
-      });
       recordingHandleRef.current = handle;
-      recordingFrameBridgeRef.current = () => handle.notifyFrameDrawn();
 
       audioElementBridgeRef.current = (audioEl) => {
         handle.setAudioElement(audioEl);
@@ -460,7 +478,7 @@ export default function CreatePageClient({
       setRecordingMode(false);
       throw err;
     }
-  }, []);
+  }, [projectType]);
 
   /**
    * audio 桥接：父级向 VideoPreview 注入回调，VideoPreview 每次切 audio 时
@@ -523,7 +541,6 @@ export default function CreatePageClient({
     }
   }, [project?.title]);
 
-  const projectType = project?.type ?? mode;
   const title = project?.title ?? "新建项目";
   const savedLabel = project
     ? `${PROJECT_TYPE_LABEL[project.type]}模式 · 创建于 ${formatCreatedLabel(project.createdAt)}`
@@ -592,6 +609,7 @@ export default function CreatePageClient({
         onClose={() => setExportModalOpen(false)}
         onStart={handleStartExport}
         sceneCount={outline?.scenes.length ?? 0}
+        projectType={projectType}
       />
 
       {exportError && (

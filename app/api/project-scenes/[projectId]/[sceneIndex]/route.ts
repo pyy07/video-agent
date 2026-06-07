@@ -61,8 +61,8 @@ export async function GET(
       });
     }
 
-    const buffer = await readFile(filePath, "utf-8");
-    return new Response(buffer, {
+    const html = await readFile(filePath, "utf-8");
+    return new Response(html, {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-cache, must-revalidate",

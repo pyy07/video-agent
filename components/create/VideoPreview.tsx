@@ -11,7 +11,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { toCanvas } from "html-to-image";
 import { pickSceneCover } from "./sceneCover";
 import { clauseIndexAt, splitNarration } from "@/lib/narration";
 import { projectAudioUrl, projectFullAudioUrl } from "@/lib/audioUrl";
@@ -58,9 +57,12 @@ type VideoPreviewProps = {
   fillContainer?: boolean;
 };
 
-/** 父级通过 ref 拿到录制用的 canvas + 当前正在播放的 <audio> */
+/** 父级通过 ref 拿到录制区域 / canvas / 当前 audio */
 export type VideoPreviewHandle = {
+  /** 图片轮播：隐藏 canvas */
   getRecordingCanvas: () => HTMLCanvasElement | null;
+  /** HTML 视频：浏览器原生采集的预览区域 */
+  getCaptureRegion: () => HTMLElement | null;
   getCurrentAudioEl: () => HTMLAudioElement | null;
 };
 
@@ -159,17 +161,12 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       isHtmlMode: false,
     });
     const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
-    // HTML 模式录制：离屏 iframe 按 1920×1080 渲染，再快照到 bitmap 供 canvas 合成
-    const recordingIframeCurrentRef = useRef<HTMLIFrameElement | null>(null);
-    const recordingIframePrevRef = useRef<HTMLIFrameElement | null>(null);
-    const htmlBitmapCacheRef = useRef<{ current: ImageBitmap | null; prev: ImageBitmap | null }>({
-      current: null,
-      prev: null,
-    });
-    const htmlIframeReadyRef = useRef({ current: false, prev: false });
+    /** HTML 模式：getDisplayMedia 裁剪此区域 */
+    const captureRegionRef = useRef<HTMLDivElement | null>(null);
 
     useImperativeHandle(ref, () => ({
       getRecordingCanvas: () => recordingCanvasRef.current,
+      getCaptureRegion: () => captureRegionRef.current,
       getCurrentAudioEl: () => audioRef.current,
     }), []);
 
@@ -660,6 +657,29 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     const activeClauseIdx = clauseIndexAt(currentClauses, sceneRatio);
     const subtitleText = activeClauseIdx >= 0 ? currentClauses[activeClauseIdx].text : "";
 
+    // 把当前播放状态写到 ref，录制循环读 ref 画到 canvas
+    useEffect(() => {
+      renderStateRef.current = {
+        currentScene,
+        prevScene,
+        prevOpacity,
+        scale: kenBurnsScale,
+        prevScale,
+        showSubtitle,
+        subtitleText,
+        isHtmlMode,
+      };
+    }, [
+      currentScene,
+      prevScene,
+      prevOpacity,
+      kenBurnsScale,
+      prevScale,
+      showSubtitle,
+      subtitleText,
+      isHtmlMode,
+    ]);
+
     // 录制开始前预加载所有分镜图片，避免 canvas 绘制时还在异步加载
     useEffect(() => {
       if (!recordingMode || isHtmlMode || !projectId) return;
@@ -673,113 +693,34 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       }
     }, [recordingMode, isHtmlMode, projectId, allScenes]);
 
-    // HTML 模式：同步离屏 iframe 的 src 到当前/叠化分镜
+    // 图片轮播：canvas 逐帧绘制；HTML 模式由 getDisplayMedia 直接采预览区
     useEffect(() => {
-      if (!recordingMode || !isHtmlMode || !projectId) return;
-
-      const curIframe = recordingIframeCurrentRef.current;
-      if (curIframe) {
-        htmlIframeReadyRef.current.current = false;
-        if (currentScene?.htmlPath) {
-          curIframe.src = sceneHtmlUrl(projectId, currentScene);
-        } else {
-          curIframe.src = "about:blank";
-        }
-      }
-
-      const prevIframe = recordingIframePrevRef.current;
-      if (prevIframe) {
-        htmlIframeReadyRef.current.prev = false;
-        if (prevScene?.htmlPath) {
-          prevIframe.src = sceneHtmlUrl(projectId, prevScene);
-        } else {
-          prevIframe.src = "about:blank";
-          htmlBitmapCacheRef.current.prev?.close();
-          htmlBitmapCacheRef.current.prev = null;
-        }
-      }
-    }, [recordingMode, isHtmlMode, projectId, currentScene, prevScene]);
-
-    // 把当前播放状态写到 ref，录制循环读 ref 画到 canvas
-    useEffect(() => {
-      renderStateRef.current = {
-        currentScene,
-        prevScene,
-        prevOpacity,
-        scale: kenBurnsScale,
-        prevScale,
-        showSubtitle,
-        subtitleText,
-        isHtmlMode,
-      };
-    });
-
-    // 录制循环：HTML 快照 + canvas 绘制 + requestFrame 统一在固定 30fps 节拍
-    useEffect(() => {
-      if (!recordingMode) return;
+      if (!recordingMode || isHtmlMode) return;
       const canvas = recordingCanvasRef.current;
       if (!canvas) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
       let stopped = false;
-      let busy = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
       let nextTickAt = performance.now();
 
-      const tick = async () => {
+      const tick = () => {
         if (stopped) return;
-        if (busy) {
-          timer = setTimeout(tick, 4);
-          return;
-        }
-        busy = true;
-        try {
-          if (isHtmlMode) {
-            const ready = htmlIframeReadyRef.current;
-            const state = renderStateRef.current;
-            if (ready.current) {
-              const iframe = recordingIframeCurrentRef.current;
-              if (iframe) {
-                const bmp = await captureIframeToBitmap(iframe);
-                if (bmp) {
-                  htmlBitmapCacheRef.current.current?.close();
-                  htmlBitmapCacheRef.current.current = bmp;
-                }
-              }
-            }
-            if (ready.prev && state.prevScene && state.prevOpacity > 0) {
-              const iframe = recordingIframePrevRef.current;
-              if (iframe) {
-                const bmp = await captureIframeToBitmap(iframe);
-                if (bmp) {
-                  htmlBitmapCacheRef.current.prev?.close();
-                  htmlBitmapCacheRef.current.prev = bmp;
-                }
-              }
-            }
-          }
 
-          drawRecordingFrame(
-            ctx,
-            canvas.width,
-            canvas.height,
-            renderStateRef.current,
-            imageCacheRef.current,
-            projectId,
-            htmlBitmapCacheRef.current,
-          );
-          onRecordingFrameDrawn?.();
-        } catch (e) {
-          console.warn("[recording] frame tick failed:", e);
-        } finally {
-          busy = false;
-          if (!stopped) {
-            nextTickAt += RECORDING_FRAME_MS;
-            const delay = Math.max(0, nextTickAt - performance.now());
-            timer = setTimeout(tick, delay);
-          }
-        }
+        drawRecordingFrame(
+          ctx,
+          canvas.width,
+          canvas.height,
+          renderStateRef.current,
+          imageCacheRef.current,
+          projectId,
+        );
+        onRecordingFrameDrawn?.();
+
+        nextTickAt += RECORDING_FRAME_MS;
+        const delay = Math.max(0, nextTickAt - performance.now());
+        timer = setTimeout(tick, delay);
       };
 
       nextTickAt = performance.now();
@@ -787,25 +728,34 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       return () => {
         stopped = true;
         if (timer) clearTimeout(timer);
-        htmlBitmapCacheRef.current.current?.close();
-        htmlBitmapCacheRef.current.prev?.close();
-        htmlBitmapCacheRef.current = { current: null, prev: null };
-        htmlIframeReadyRef.current = { current: false, prev: false };
       };
     }, [recordingMode, isHtmlMode, projectId, onRecordingFrameDrawn]);
 
     if (!scene || allScenes.length === 0) return <EmptyPreview fillContainer={fillContainer} />;
 
     return (
-      <div className={fillContainer ? "flex h-full min-h-0 flex-col gap-2" : "space-y-3"}>
+      <div
+        className={
+          fillContainer
+            ? "relative flex h-full min-h-0 flex-col gap-2"
+            : "relative space-y-3"
+        }
+      >
         <div
+          ref={captureRegionRef}
           className={
             fillContainer
-              ? "relative w-full flex-1 overflow-hidden rounded-xl shadow-soft"
+              ? recordingMode && isHtmlMode
+                ? "relative mx-auto w-full max-h-full overflow-hidden rounded-xl shadow-soft"
+                : "relative w-full flex-1 overflow-hidden rounded-xl shadow-soft"
               : "relative h-[420px] w-full overflow-hidden rounded-xl shadow-soft"
           }
+          style={
+            recordingMode && isHtmlMode && fillContainer
+              ? { aspectRatio: "16 / 9" }
+              : undefined
+          }
         >
-          {/* 底层：当前镜（始终满 opacity，新镜出现时被上层 prev 渐隐让位露出来） */}
           {currentScene && (
             <SceneLayer
               scene={currentScene}
@@ -816,7 +766,6 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
               isHtmlMode={isHtmlMode}
             />
           )}
-          {/* 上层：上一镜，opacity 1 → 0 触发叠化 */}
           {prevScene && (
             <SceneLayer
               key={`prev-${prevScene.index}`}
@@ -828,32 +777,15 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
               isHtmlMode={isHtmlMode}
             />
           )}
-          <div className="absolute left-4 top-4 flex items-center gap-1.5">
-            <span className="rounded-md bg-black/40 px-2 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
-              {currentScene?.title ?? ""}
-            </span>
-            <span className="rounded-md bg-black/40 px-1.5 py-1 text-[10px] text-white/80 backdrop-blur-sm">
-              {currentIndex + 1}/{allScenes.length}
-            </span>
-          </div>
-          {recordingMode && (
-            <div className="absolute right-4 top-4 flex items-center gap-1.5 rounded-md bg-red-500/95 px-2 py-1 text-[11px] font-semibold text-white shadow-md backdrop-blur-sm">
-              <span className="relative grid h-2 w-2 place-items-center">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-white/80" />
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-white" />
+          {(!recordingMode || !isHtmlMode) && (
+            <div className="absolute left-4 top-4 flex items-center gap-1.5">
+              <span className="rounded-md bg-black/40 px-2 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
+                {currentScene?.title ?? ""}
               </span>
-              录制中
+              <span className="rounded-md bg-black/40 px-1.5 py-1 text-[10px] text-white/80 backdrop-blur-sm">
+                {currentIndex + 1}/{allScenes.length}
+              </span>
             </div>
-          )}
-          {onRecordingCancel && recordingMode && (
-            <button
-              type="button"
-              onClick={onRecordingCancel}
-              aria-label="取消录制"
-              className="absolute right-4 top-14 grid h-8 w-8 place-items-center rounded-md bg-black/55 text-white/90 backdrop-blur-sm transition hover:bg-black/75"
-            >
-              <X className="h-4 w-4" />
-            </button>
           )}
           {showSubtitle && subtitleText && (
             <div className="absolute inset-x-0 bottom-8 flex justify-center px-6 pointer-events-none">
@@ -861,7 +793,6 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                 key={activeClauseIdx}
                 className="max-w-[90%] rounded-md px-5 py-2 text-center text-lg font-semibold leading-snug text-white"
                 style={{
-                  // 多重 text-shadow：黑色描边 + 深阴影，确保亮底深底都清晰
                   textShadow:
                     "0 2px 6px rgba(0,0,0,0.85), 0 0 2px rgba(0,0,0,0.9), 0 1px 0 rgba(0,0,0,0.9), 0 -1px 0 rgba(0,0,0,0.9), 1px 0 0 rgba(0,0,0,0.9), -1px 0 0 rgba(0,0,0,0.9)",
                   letterSpacing: "0.02em",
@@ -872,6 +803,25 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             </div>
           )}
         </div>
+        {recordingMode && (
+          <div className="pointer-events-none absolute right-4 top-4 z-20 flex items-center gap-1.5 rounded-md bg-red-500/95 px-2 py-1 text-[11px] font-semibold text-white shadow-md backdrop-blur-sm">
+            <span className="relative grid h-2 w-2 place-items-center">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-white/80" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-white" />
+            </span>
+            录制中
+          </div>
+        )}
+        {onRecordingCancel && recordingMode && (
+          <button
+            type="button"
+            onClick={onRecordingCancel}
+            aria-label="取消录制"
+            className="absolute right-4 top-14 z-20 grid h-8 w-8 place-items-center rounded-md bg-black/55 text-white/90 backdrop-blur-sm transition hover:bg-black/75"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        )}
         <div className="flex shrink-0 items-center gap-3 px-2">
           {recordingMode ? (
             // 录屏中：禁用播放/暂停/拖动按钮，避免误操作打断录制
@@ -904,76 +854,21 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
           </button>
         </div>
 
-        {/* HTML 模式录制：离屏 iframe 承载真实动画，canvas 通过快照合成 */}
-        {recordingMode && isHtmlMode && projectId && (
-          <div
+        {!isHtmlMode && (
+          <canvas
+            ref={recordingCanvasRef}
+            width={RECORDING_W}
+            height={RECORDING_H}
             className="pointer-events-none fixed left-[-9999px] top-0 opacity-0"
-            style={{ width: RECORDING_W, height: RECORDING_H }}
             aria-hidden
-          >
-            <iframe
-              ref={recordingIframeCurrentRef}
-              title="录制当前镜"
-              width={RECORDING_W}
-              height={RECORDING_H}
-              className="block border-0"
-              sandbox="allow-scripts allow-same-origin"
-              onLoad={() => {
-                htmlIframeReadyRef.current.current = true;
-              }}
-            />
-            <iframe
-              ref={recordingIframePrevRef}
-              title="录制叠化镜"
-              width={RECORDING_W}
-              height={RECORDING_H}
-              className="absolute left-0 top-0 block border-0"
-              sandbox="allow-scripts allow-same-origin"
-              onLoad={() => {
-                htmlIframeReadyRef.current.prev = true;
-              }}
-            />
-          </div>
+          />
         )}
-
-        {/* 录制 canvas：移出视口但保持可渲染，captureStream 才能稳定抓帧。 */}
-        <canvas
-          ref={recordingCanvasRef}
-          width={RECORDING_W}
-          height={RECORDING_H}
-          className="pointer-events-none fixed left-[-9999px] top-0 opacity-0"
-          aria-hidden
-        />
       </div>
     );
   },
 );
 
-// ===================== 录制帧绘制 =====================
-
-const HTML_CAPTURE_OPTS = {
-  width: RECORDING_W,
-  height: RECORDING_H,
-  canvasWidth: RECORDING_W,
-  canvasHeight: RECORDING_H,
-  pixelRatio: 1,
-};
-
-function sceneHtmlUrl(projectId: string, scene: OutlineScene): string {
-  return `/api/project-scenes/${projectId}/${scene.index}.html`;
-}
-
-async function captureIframeToBitmap(iframe: HTMLIFrameElement): Promise<ImageBitmap | null> {
-  const doc = iframe.contentDocument;
-  if (!doc?.body) return null;
-  const snap = await toCanvas(doc.body, {
-    ...HTML_CAPTURE_OPTS,
-    skipFonts: true,
-  });
-  return createImageBitmap(snap);
-}
-
-type HtmlBitmapCache = { current: ImageBitmap | null; prev: ImageBitmap | null };
+// ===================== 录制帧绘制（图片轮播） =====================
 
 type RenderState = {
   currentScene: OutlineScene | null;
@@ -993,51 +888,28 @@ function drawRecordingFrame(
   s: RenderState,
   imageCache: Map<string, HTMLImageElement>,
   projectId: string | null,
-  htmlBitmaps: HtmlBitmapCache,
 ): void {
-  // 1) 清屏 → 黑底
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, w, h);
 
-  // 2) 画 prev（叠化上层，opacity 0~1）
   if (s.prevScene) {
     drawSceneLayer(
-      ctx,
-      w,
-      h,
-      s.prevScene,
-      s.prevScale,
-      s.prevOpacity,
-      s.isHtmlMode,
-      imageCache,
-      projectId,
-      htmlBitmaps.prev,
+      ctx, w, h, s.prevScene, s.prevScale, s.prevOpacity,
+      imageCache, projectId,
     );
   }
-  // 3) 画 current（满 opacity）
   if (s.currentScene) {
     drawSceneLayer(
-      ctx,
-      w,
-      h,
-      s.currentScene,
-      s.scale,
-      1,
-      s.isHtmlMode,
-      imageCache,
-      projectId,
-      htmlBitmaps.current,
+      ctx, w, h, s.currentScene, s.scale, 1,
+      imageCache, projectId,
     );
   } else {
     drawEmptyState(ctx, w, h);
   }
 
-  // 4) 角标：分镜序号
   if (s.currentScene) {
-    drawBadge(ctx, w, `${s.currentScene.title} · 录制中`, 24, 24);
+    drawBadge(ctx, w, s.currentScene.title, 24, 24);
   }
-
-  // 5) 字幕
   if (s.showSubtitle && s.subtitleText) {
     drawSubtitle(ctx, w, h, s.subtitleText);
   }
@@ -1050,35 +922,16 @@ function drawSceneLayer(
   scene: OutlineScene,
   scale: number,
   opacity: number,
-  isHtmlMode: boolean,
   imageCache: Map<string, HTMLImageElement>,
   projectId: string | null,
-  htmlBitmap: ImageBitmap | null = null,
 ): void {
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, opacity));
 
-  const hasImage = Boolean(scene.imagePath);
-  const hasHtml = Boolean(scene.htmlPath);
-  const imageUrl = hasImage && projectId
+  const imageUrl = scene.imagePath && projectId
     ? `/api/project-images/${projectId}/${scene.index}.png`
     : null;
 
-  // HTML 模式：优先用离屏 iframe 快照（与预览 iframe 内容一致）
-  if (isHtmlMode && hasHtml) {
-    if (htmlBitmap) {
-      ctx.drawImage(htmlBitmap, 0, 0, w, h);
-    } else {
-      drawCoverGradient(ctx, w, h, scene.index);
-    }
-    ctx.restore();
-    return;
-  }
-
-  // 渲染优先级：
-  //  - image 模式 + 有图 → drawImage（cover + Ken Burns）
-  //  - HTML 模式 + 有图 → 仍然 drawImage（很多 HTML 模式也有图作为背景）
-  //  - 无图 → 画 cover 渐变
   if (imageUrl) {
     const img = imageCache.get(imageUrl);
     if (img && img.complete && img.naturalWidth > 0) {
@@ -1087,9 +940,6 @@ function drawSceneLayer(
       drawCoverGradient(ctx, w, h, scene.index);
       if (!img) {
         const newImg = new globalThis.Image();
-        newImg.onload = () => {
-          /* 下次 RAF 自然会重画 */
-        };
         newImg.src = imageUrl;
         imageCache.set(imageUrl, newImg);
       }
