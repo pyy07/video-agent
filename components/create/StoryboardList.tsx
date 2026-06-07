@@ -5,6 +5,7 @@ import { BarChart3, Code2, Eye, ImageIcon, Loader2, MoreHorizontal, Plus, Sparkl
 import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { pickSceneCover } from "./sceneCover";
+import { countPendingGenerateTasks } from "@/lib/pendingGenerateTasks";
 import { projectAudioUrl } from "@/lib/audioUrl";
 import type { OutlineScene } from "@/lib/outlineTypes";
 import type { ProjectType } from "@/lib/projectTypes";
@@ -54,21 +55,11 @@ export function StoryboardList({
 }: StoryboardListProps) {
   const isHtmlMode = projectType === "html";
 
-  // 缺失任务数：
-  //  - image 模式：缺图算 1、缺音算 1（同一镜两样都缺算 2）
-  //  - html 模式：缺 HTML 动画算 1、缺音算 1（同一镜两样都缺算 2）
-  const missingCount = useMemo(() => {
-    let n = 0;
-    for (const s of scenes) {
-      if (isHtmlMode) {
-        if (!s.htmlPath) n++;
-      } else {
-        if (!s.imagePath) n++;
-      }
-      if (!s.audioPath) n++;
-    }
-    return n;
-  }, [scenes, isHtmlMode]);
+  // 缺失任务数：每镜画面/HTML 各 1；整片旁白音频缺则 +1（不按分镜重复计）
+  const missingCount = useMemo(
+    () => countPendingGenerateTasks(scenes, isHtmlMode),
+    [scenes, isHtmlMode],
+  );
 
   /**
    * 资源 cache-buster：大纲被服务端刷新（chat 回了新大纲、编辑弹窗里重新生成了
@@ -123,8 +114,8 @@ export function StoryboardList({
                     ? "所有分镜的动画和音频都已生成"
                     : "所有分镜的画面和音频都已生成"
                   : isHtmlMode
-                  ? `还有 ${missingCount} 项待生成（动画 + 音频）`
-                  : `还有 ${missingCount} 项待生成（画面 + 音频）`
+                  ? `还有 ${missingCount} 项待生成（动画按镜 + 整片音频）`
+                  : `还有 ${missingCount} 项待生成（画面按镜 + 整片音频）`
               }
               className={clsx(
                 "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition",
@@ -401,15 +392,15 @@ function generateButtonLabel(needVisual: boolean, needAudio: boolean, isHtmlMode
 function generateButtonTitle(needVisual: boolean, needAudio: boolean, isHtmlMode: boolean): string {
   if (needVisual && needAudio) {
     return isHtmlMode
-      ? "仅补缺失的动画和音频（不会重做已有素材）"
-      : "仅补缺失的画面和音频（不会重做已有素材）";
+      ? "补缺失的动画；旁白为整片一次生成（含所有分镜）"
+      : "补缺失的画面；旁白为整片一次生成（含所有分镜）";
   }
   if (needVisual) {
     return isHtmlMode
       ? "仅补缺失的网页动画（不会重做已有音频）"
       : "仅补缺失的画面（不会重做已有音频）";
   }
-  return "仅补缺失的音频（不会重做已有画面）";
+  return "整片生成一次旁白音频（含所有分镜，不会重做已有画面）";
 }
 
 function formatDuration(narrationChars: number): string {

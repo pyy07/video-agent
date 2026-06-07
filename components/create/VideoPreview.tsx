@@ -10,13 +10,15 @@ import {
   useMemo,
   useRef,
   useState,
+  type MutableRefObject,
 } from "react";
 import { pickSceneCover } from "./sceneCover";
-import { clauseIndexAt, splitNarration } from "@/lib/narration";
+import { splitNarration, subtitleClauseIndexAt } from "@/lib/narration";
 import { projectAudioUrl, projectFullAudioUrl } from "@/lib/audioUrl";
 import {
   computeSceneAudioSlices,
   sceneAudioMapsFromSlices,
+  speechDurationInSlice,
 } from "@/lib/audioSlices";
 import type { OutlineScene } from "@/lib/outlineTypes";
 import type { ProjectType } from "@/lib/projectTypes";
@@ -98,6 +100,8 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     const [currentTime, setCurrentTime] = useState(0);
     const [totalDuration, setTotalDuration] = useState(0);
     const [sceneDurations, setSceneDurations] = useState<Record<number, number>>({});
+    /** 各镜时长/起始时间轴是否已从 mp3 元数据加载完成 */
+    const [sceneTimelineReady, setSceneTimelineReady] = useState(false);
     /** 当前镜透明度：交叉叠化时 0→1 */
     const [currentOpacity, setCurrentOpacity] = useState(1);
     /** 上一镜（outgoing layer），叠化时 1→0 */
@@ -165,6 +169,8 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     /** 录制叠化：按 wall-clock 插值，不依赖 React 低频更新 */
     const fadeStartedAtRef = useRef<number | null>(null);
     const fadeOutgoingSceneRef = useRef<OutlineScene | null>(null);
+    /** 导出帧绘制：上次已稳定展示的镜序号，用于检测切镜并启动叠化 */
+    const recordingLastSceneIndexRef = useRef(-1);
     /** HTML 模式：getDisplayMedia 裁剪此区域 */
     const captureRegionRef = useRef<HTMLDivElement | null>(null);
 
@@ -243,20 +249,36 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     }, [projectId, allScenes, audioGeneratedAt]);
 
     useEffect(() => {
-      if (allScenes.length === 0) return;
+      if (allScenes.length === 0) {
+        setSceneTimelineReady(false);
+        return;
+      }
       let cancelled = false;
+      setSceneTimelineReady(false);
 
       (async () => {
         const fullDur = await loadFullAudioDuration();
         if (cancelled) return;
 
+        const hasPerSceneAudio = allScenes.every((s) => s.audioPath);
+
         if (fullDur && fullDur > 0) {
           useFullAudioRef.current = true;
-          const slices = computeSceneAudioSlices(allScenes, fullDur);
-          const { durations, starts, totalSec } = sceneAudioMapsFromSlices(slices);
-          setSceneDurations(durations);
-          sceneStartSecRef.current = starts;
-          setTotalDuration(totalSec > 0 ? totalSec : fullDur);
+          // 优先用各镜 mp3 实测时长累加时间轴，与 ffmpeg 切分结果一致，避免字数估算提前切镜
+          if (hasPerSceneAudio) {
+            const measured = await loadPerSceneDurations();
+            if (cancelled) return;
+            setSceneDurations(measured.durations);
+            sceneStartSecRef.current = measured.starts;
+            setTotalDuration(Math.max(measured.totalSec, fullDur));
+          } else {
+            const slices = computeSceneAudioSlices(allScenes, fullDur);
+            const { durations, starts, totalSec } = sceneAudioMapsFromSlices(slices);
+            setSceneDurations(durations);
+            sceneStartSecRef.current = starts;
+            setTotalDuration(totalSec > 0 ? totalSec : fullDur);
+          }
+          setSceneTimelineReady(true);
           return;
         }
 
@@ -270,6 +292,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             ? fallback.totalSec
             : allScenes.length * DEFAULT_SCENE_DURATION,
         );
+        setSceneTimelineReady(true);
       })();
 
       return () => {
@@ -491,7 +514,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
           }
         }
 
-        if (elapsed >= dur - 0.05) {
+        if (elapsed >= dur - 0.01) {
           setCurrentTime(dur);
           if (idx >= allScenes.length - 1) {
             doneFiredRef.current = true;
@@ -579,7 +602,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
      * effect，否则录到的画面不一定是视频全屏的样子。
      */
     useEffect(() => {
-      if (!recordingMode || !recordingCaptureReady) return;
+      if (!recordingMode || !recordingCaptureReady || !sceneTimelineReady) return;
       isRunningRef.current = false;
       clearAll();
       if (audioRef.current) {
@@ -590,6 +613,9 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setCurrentIndex(0);
       setCurrentTime(0);
       clearPrevLayer();
+      recordingLastSceneIndexRef.current = -1;
+      fadeStartedAtRef.current = null;
+      fadeOutgoingSceneRef.current = null;
       if (allScenes.length === 0) {
         // 边界：没有分镜直接结束
         onRecordingComplete?.();
@@ -604,7 +630,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       startProgress();
       // 录屏模式不依赖 deps 重新触发，只在翻 true 时启动一次
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [recordingMode, recordingCaptureReady]);
+    }, [recordingMode, recordingCaptureReady, sceneTimelineReady]);
 
     // 交叉叠化：prevScene 出现后下一帧同时启动旧镜淡出 + 新镜淡入
     useEffect(() => {
@@ -721,18 +747,41 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
 
     const progressRatio = totalDuration > 0 ? playedTotal / totalDuration : 0;
 
-    // 字幕分句 + 同步：把当前镜的旁白按标点切成短句，再用 currentTime/sceneDuration 落到对应短句。
-    // 字数比例 = 播放比例（短句长 → 占的播放窗口长）。
+    // 字幕分句：按标点切短句，时钟略提前于音频并扣除镜间停顿权重（整片 mp3 模式）
     const currentClauses = useMemo(
       () => (currentScene ? splitNarration(currentScene.narration) : []),
       [currentScene],
     );
     const currentSceneDuration =
       sceneDurations[currentScene?.index ?? -1] ?? DEFAULT_SCENE_DURATION;
-    const sceneRatio = currentSceneDuration > 0
-      ? Math.min(currentTime / currentSceneDuration, 1)
-      : 0;
-    const activeClauseIdx = clauseIndexAt(currentClauses, sceneRatio);
+
+    // 字幕：用镜内有效朗读时长 + 略提前的时钟，与 TTS 对齐
+    const subtitleElapsed = (() => {
+      if (!isPlaying && !recordingMode) return currentTime;
+      const audio = audioRef.current;
+      const sc = currentScene;
+      if (!sc) return currentTime;
+      if (useFullAudioRef.current && audio) {
+        const start = sceneStartSecRef.current[sc.index] ?? 0;
+        return Math.max(0, audio.currentTime - start);
+      }
+      if (audio && sc.audioPath) return audio.currentTime;
+      return currentTime;
+    })();
+    const subtitleSpeechDuration = currentScene
+      ? useFullAudioRef.current
+        ? speechDurationInSlice(
+            currentScene.narration,
+            currentSceneDuration,
+            currentIndex >= allScenes.length - 1,
+          )
+        : currentSceneDuration
+      : currentSceneDuration;
+    const activeClauseIdx = subtitleClauseIndexAt(
+      currentClauses,
+      subtitleElapsed,
+      subtitleSpeechDuration,
+    );
     const subtitleText = activeClauseIdx >= 0 ? currentClauses[activeClauseIdx].text : "";
 
     // 把当前播放状态写到 ref（非录制时 canvas 不读此值，仅作兜底）
@@ -811,12 +860,9 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             currentIndex: currentIndexRef.current,
             sceneElapsed: sceneElapsedRef.current,
             showSubtitle,
-            fadeStartedAt: fadeStartedAtRef.current,
-            fadeOutgoingScene: fadeOutgoingSceneRef.current,
-            onFadeComplete: () => {
-              fadeStartedAtRef.current = null;
-              fadeOutgoingSceneRef.current = null;
-            },
+            fadeStartedAtRef,
+            fadeOutgoingSceneRef,
+            recordingLastSceneIndexRef,
           },
         );
 
@@ -859,7 +905,9 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             fillContainer
               ? recordingMode && isHtmlMode
                 ? "relative mx-auto w-full max-h-full overflow-hidden rounded-xl shadow-soft"
-                : "relative w-full flex-1 overflow-hidden rounded-xl shadow-soft"
+                : recordingMode && !isHtmlMode
+                  ? "relative mx-auto flex aspect-video w-full max-h-full items-center justify-center overflow-hidden rounded-xl bg-black shadow-soft"
+                  : "relative w-full flex-1 overflow-hidden rounded-xl shadow-soft"
               : "relative h-[420px] w-full overflow-hidden rounded-xl shadow-soft"
           }
           style={
@@ -873,7 +921,8 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
               ref={recordingCanvasRef}
               width={RECORDING_W}
               height={RECORDING_H}
-              className="absolute inset-0 h-full w-full"
+              className="h-full w-full"
+              style={{ objectFit: "contain" }}
             />
           ) : (
             <>
@@ -908,7 +957,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
               </span>
             </div>
           )}
-          {showSubtitle && subtitleText && (
+          {showSubtitle && subtitleText && (!recordingMode || isHtmlMode) && (
             <div className="absolute inset-x-0 bottom-8 flex justify-center px-6 pointer-events-none">
               <span
                 key={activeClauseIdx}
@@ -996,9 +1045,9 @@ type SyncRecordingParams = {
   currentIndex: number;
   sceneElapsed: number;
   showSubtitle: boolean;
-  fadeStartedAt: number | null;
-  fadeOutgoingScene: OutlineScene | null;
-  onFadeComplete: () => void;
+  fadeStartedAtRef: MutableRefObject<number | null>;
+  fadeOutgoingSceneRef: MutableRefObject<OutlineScene | null>;
+  recordingLastSceneIndexRef: MutableRefObject<number>;
 };
 
 /** 按音频时钟计算当前镜 / 交叉叠化，保证导出 30fps 连续 */
@@ -1007,30 +1056,55 @@ function syncRecordingRenderState(
   params: SyncRecordingParams,
 ): void {
   const clock = resolvePlaybackClock(params);
+  const lastIdx = params.recordingLastSceneIndexRef.current;
+
+  if (lastIdx < 0) {
+    params.recordingLastSceneIndexRef.current = clock.sceneIndex;
+  } else if (
+    clock.sceneIndex !== lastIdx &&
+    params.fadeStartedAtRef.current === null
+  ) {
+    params.fadeStartedAtRef.current = performance.now();
+    params.fadeOutgoingSceneRef.current = params.allScenes[lastIdx] ?? null;
+  }
+
   const sc = params.allScenes[clock.sceneIndex] ?? null;
   const dur = sc
     ? params.sceneDurations[sc.index] ?? DEFAULT_SCENE_DURATION
     : DEFAULT_SCENE_DURATION;
 
-  let prevScene = params.fadeOutgoingScene;
+  let prevScene = params.fadeOutgoingSceneRef.current;
   let prevOpacity = 1;
   let currentOpacity = 1;
-  if (params.fadeStartedAt !== null && prevScene) {
-    const fadeT = Math.min(1, (performance.now() - params.fadeStartedAt) / FADE_DURATION_MS);
+  const fadeStartedAt = params.fadeStartedAtRef.current;
+  if (fadeStartedAt !== null && prevScene) {
+    const fadeT = Math.min(1, (performance.now() - fadeStartedAt) / FADE_DURATION_MS);
     prevOpacity = 1 - fadeT;
     currentOpacity = fadeT;
     if (fadeT >= 1) {
       prevScene = null;
       currentOpacity = 1;
-      params.onFadeComplete();
+      params.fadeStartedAtRef.current = null;
+      params.fadeOutgoingSceneRef.current = null;
+      params.recordingLastSceneIndexRef.current = clock.sceneIndex;
     }
   } else {
     prevScene = null;
+    if (fadeStartedAt === null) {
+      params.recordingLastSceneIndexRef.current = clock.sceneIndex;
+    }
   }
 
   const clauses = sc ? splitNarration(sc.narration) : [];
-  const sceneRatio = dur > 0 ? Math.min(clock.sceneElapsed / dur, 1) : 0;
-  const clauseIdx = clauseIndexAt(clauses, sceneRatio);
+  const speechDur =
+    sc && params.useFullAudio
+      ? speechDurationInSlice(
+          sc.narration,
+          dur,
+          clock.sceneIndex >= params.allScenes.length - 1,
+        )
+      : dur;
+  const clauseIdx = subtitleClauseIndexAt(clauses, clock.sceneElapsed, speechDur);
   const subtitleText = clauseIdx >= 0 ? clauses[clauseIdx].text : "";
 
   target.current = {

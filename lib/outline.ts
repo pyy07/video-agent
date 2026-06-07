@@ -1,5 +1,11 @@
 import "server-only";
 import { callLLM } from "./ai";
+import {
+  buildSceneImagePrompt,
+  globalStyleToProse,
+  normalizeGlobalStylePrompt,
+  tryParseGlobalStyleJson,
+} from "./imagePrompt";
 import type { VideoOutline, OutlineScene } from "./outlineTypes";
 import type { ProjectType } from "./projectTypes";
 
@@ -40,6 +46,7 @@ export async function generateOutline(
   let globalStylePrompt: string | undefined;
   if (input.mode === "image") {
     globalStylePrompt = await generateGlobalStylePrompt(input.prompt, input.history);
+    globalStylePrompt = normalizeGlobalStylePrompt(globalStylePrompt);
   }
 
   const system = buildOutlineSystemPrompt(input.mode, globalStylePrompt);
@@ -62,20 +69,31 @@ async function generateGlobalStylePrompt(
   prompt: string,
   history: ReadonlyArray<{ role: "user" | "assistant"; content: string }>,
 ): Promise<string> {
-  const styleSystem = `你是 AI 视频创作助手的大纲生成器。
+  const styleSystem = `你是 AI 视频创作助手的大纲生成器，专注「图片轮播 + 旁白讲解」类短视频（人物传记、历史事件、知识科普、文化解读等）。
 
 # 你的任务
-根据用户的创作想法，分析视频主题与核心概念，从以下维度为整个视频生成一组合一的全局画面风格描述：
+根据用户的创作想法，为整组视频输出**一套统一的全局画面风格**（JSON 对象）。后续每个分镜只会单独描述「本镜主体画面」，不会再重复写风格，因此请把风格信息写全。
 
-1. **主题锚点（Topic Anchor）**：用 1 句话概括用户想讲什么，后续所有画面必须服务这个主题
-2. **整体风格（Overall Style）**：写实 / 插画 / 3D 渲染 / 水彩 / 赛博朋克 / 宫崎骏风格 等
-3. **光照与色调（Lighting & Color Palette）**：柔和日光 / 戏剧性暗光 / 赛博朋克霓虹 / 暖色调 / 冷色调 等
-4. **摄影与构图（Composition）**：电影感宽屏 / 特写镜头 / 远景全景 / 对称构图 等
-5. **氛围关键词（Mood Keywords）**：史诗感 / 温馨 / 神秘 / 科技感 / 复古 等
+# 字段说明（全部用英文填写）
+- visualMotif：贯穿全片的视觉母题（如 historical portrait series / documentary photo essay / illustrated timeline）
+- overallStyle：整体画风（写实摄影 / 纪实插画 / 油画质感 / 3D 等）
+- lightingColor：光照与主色调
+- composition：构图习惯（16:9 宽屏、居中主体、留白字幕区等）
+- mood：氛围关键词
 
-生成 2-4 句英文风格描述：第一句必须点明主题相关的视觉母题（recurring visual motif），其余句子描述风格、光照、构图与氛围。这段文字会被 prepended 到每个分镜的画面提示词前面。
+# 题材提示
+- 讲人物：偏向肖像、代表性场景、时代符号，风格庄重或传记感
+- 讲事件：偏向时间节点、地点、群像与关键物件，偏纪实或历史插画
+- 讲概念：可用隐喻画面，但仍需清晰、易懂、不跑题
 
-直接输出纯文本风格描述，不要 JSON，不要 Markdown 围栏，不要解释。`;
+# 输出格式（严格 JSON，不要 Markdown 围栏）
+{
+  "visualMotif": "...",
+  "overallStyle": "...",
+  "lightingColor": "...",
+  "composition": "...",
+  "mood": "..."
+}`;
 
   const messages = [
     ...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
@@ -83,44 +101,50 @@ async function generateGlobalStylePrompt(
   ];
 
   const raw = await callLLM({ system: styleSystem, messages });
-  return raw.trim();
+  const parsed = tryParseGlobalStyleJson(raw);
+  if (parsed) return globalStyleToProse(parsed);
+
+  // 兜底：模型未按 JSON 返回时仍归一化为 prose
+  return normalizeGlobalStylePrompt(raw);
 }
 
 function buildOutlineSystemPrompt(mode: ProjectType, globalStylePrompt?: string): string {
   const modeBlock =
     mode === "html"
-      ? `# 当前模式：HTML 动画视频
+      ? `# 当前模式：HTML 动画视频（适合数学定理、几何推导、公式变换、流程演示等）
 你正在为「网页动画视频」模式输出分镜大纲。画面提示词 \`prompt\` 必须用中文写成网页动画规格（这是后续「分镜 HTML 生成器」直接拿来写代码的依据），必须覆盖以下维度：
-- **旁白对应画面**：动画必须展示本镜 narration 正在讲解的概念/对象/过程，不要用无关背景动画糊弄
-- **屏幕元素**：屏幕上要出现哪些 HTML/CSS 元素（如 div / svg / canvas / img / 文字节点）
-- **元素动作**：每个元素如何运动（位移 / 旋转 / 缩放 / 透明度 / 形变 / 路径）
+- **旁白对应画面**：动画必须展示本镜 narration 正在讲解的概念/对象/过程（如定理条件、辅助线、公式步骤），不要用无关背景动画糊弄
+- **屏幕元素**：屏幕上要出现哪些 HTML/CSS 元素（如 div / svg / canvas / 公式文字 / 几何图形）
+- **元素动作**：每个元素如何运动（位移 / 旋转 / 缩放 / 透明度 / 形变 / 路径），推导步骤要按顺序出现
 - **缓动与时长**：缓动函数（ease-in / ease-out / linear / cubic-bezier）与每个动作的持续时长（秒）
-- **整体氛围**：配色（主色 / 辅色 / 背景色）、字体、风格基调（极简 / 卡通 / 科幻 / 中国风 等）
-- **镜头与版式**：版心比例（16:9 / 9:16 / 1:1）、主要元素在屏幕的相对位置
+- **整体氛围**：配色（主色 / 辅色 / 背景色）、字体、风格基调（极简 / 卡通 / 科幻 / 课堂板书 等）
+- **镜头与版式**：版心比例 16:9、主要元素在屏幕的相对位置，预留底部字幕区
 
 请把每个分镜的 \`prompt\` 写成一段连续的中文描述，描述清楚「画什么 + 怎么动 + 多长时间」，避免空泛形容词。`
-      : `# 当前模式：图片轮播视频
-画面提示词 \`prompt\` 必须用英文写成图片生成提示词（Stable Diffusion / Midjourney 风格），覆盖：
-- **subject（主体）**：必须来自本镜 narration 的核心内容，不要跑题
-- **style（风格）**：写实 / 插画 / 3D / 水彩 等
-- **lighting（光照）**：柔和 / 戏剧性 / 逆光 等
-- **composition（构图）**：特写 / 远景 / 居中 / 三分法 等
-- **palette（调色）**：暖色 / 冷色 / 高饱和 等
-- **detail（细节）**：加入 narration 中的关键名词、动作或对比关系`;
+      : `# 当前模式：图片轮播视频（适合人物传记、历史事件、文化科普等「画面 + 旁白讲解」）
+每个分镜的 \`prompt\` 字段**只写本镜主体画面的英文描述**（subject），不要重复全局风格（全局风格会由系统自动拼接一次）。
 
-  const globalStyleNote = globalStylePrompt
-    ? `# 全局风格参考
-以下是你生成的全局画面风格描述，所有分镜的 prompt 必须以这段文字开头：
+用 Stable Diffusion / Midjourney 风格英文，聚焦：
+- **subject（主体）**：本镜 narration 正在讲的人物、事件、场景、物件或象征画面，必须贴题
+- **action / context（情境）**：人物在做什么、事件发生在何时何地、与旁白一致的关键细节
+- **shot（景别）**：portrait / medium shot / wide establishing shot / detail close-up 等（选一种即可）
+
+不要在本镜 prompt 里写 overall style、lighting palette、mood 等全局项；不要输出 JSON。`;
+
+  const globalStyleNote =
+    mode === "image" && globalStylePrompt
+      ? `# 全局风格（已生成，勿在分镜 prompt 中重复）
+系统已为全片生成以下英文全局风格，**不要**写进各分镜的 \`prompt\` 字段：
 "${globalStylePrompt}"
 
-每个分镜的 \`prompt\` 字段格式为：【全局风格描述】+【本分镜具体画面内容】
-例：${globalStylePrompt.slice(0, 80)}..., a dragon flying over mountains`
-    : "";
+每个分镜的 \`prompt\` 仅写本镜 subject（英文短句或短语），例：
+"A portrait of ...", "A wide shot of the battle at ...", "Close-up of an ancient manuscript showing ..."`
+      : "";
 
   const roleIntro =
     mode === "html"
-      ? `你是一个网页动画视频设计工程师，同时承担 AI 视频创作助手的大纲生成器职责。你的核心工作是把用户的创作想法拆解成一组分镜，并为每个分镜写清楚「网页里要实现什么动画」。后续会有「分镜 HTML 生成器」基于你写的 prompt 写出真实可运行的 HTML/CSS/JS 代码，所以你给出的 prompt 必须能让对方直接动手写代码。`
-      : `你是一位擅长知识科普与解说类短视频的脚本策划与分镜师。你的核心工作是把用户的创作想法拆解成一组分镜，并为每个分镜写清楚「画面里要呈现什么视觉内容」，由图片生成模型据此出图。`;
+      ? `你是一个网页动画视频设计工程师，同时承担 AI 视频创作助手的大纲生成器职责。你的核心工作是把用户的创作想法（尤其是数学定理、几何证明、公式推导、步骤演示）拆解成一组分镜，并为每个分镜写清楚「网页里要实现什么动画」。后续会有「分镜 HTML 生成器」基于你写的 prompt 写出真实可运行的 HTML/CSS/JS 代码，所以你给出的 prompt 必须能让对方直接动手写代码。`
+      : `你是一位擅长人物故事、历史事件与知识科普的短视频分镜师。你的核心工作是把用户的创作想法拆解成一组分镜：旁白负责讲解，画面负责呈现人物、场景与关键细节，由图片生成模型据此出图。`;
 
   return `${roleIntro}
 
@@ -225,10 +249,15 @@ export function parseOutlineResponse(
     if (typeof prompt !== "string" || prompt.trim().length === 0) {
       throw new Error(`outline_shape_invalid: scene[${i}].prompt invalid`);
     }
-    // image模式下，将全局风格 prepended 到 scene prompt 前面
-    const fullPrompt = globalStylePrompt
-      ? `${globalStylePrompt} ${prompt.trim()}`
-      : prompt.trim();
+    // image 模式：全局风格 + 本镜 subject 只拼一次
+    const normalizedGlobal =
+      mode === "image" && globalStylePrompt
+        ? normalizeGlobalStylePrompt(globalStylePrompt)
+        : "";
+    const fullPrompt =
+      mode === "image" && normalizedGlobal
+        ? buildSceneImagePrompt(normalizedGlobal, prompt.trim())
+        : prompt.trim();
     scenes.push({
       index,
       title: title.slice(0, 80),
@@ -248,7 +277,10 @@ export function parseOutlineResponse(
   return {
     mode,
     script: script.slice(0, 20000),
-    globalStylePrompt,
+    globalStylePrompt:
+      mode === "image" && globalStylePrompt
+        ? normalizeGlobalStylePrompt(globalStylePrompt)
+        : globalStylePrompt,
     scenes,
     generatedAt: new Date().toISOString(),
   };

@@ -1,7 +1,7 @@
 import "server-only";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import OpenAI from "openai";
+import { enrichPromptForImageGeneration } from "./imagePrompt";
 
 /**
  * ModelScope / z-image-turbo 图片生成模块。
@@ -16,21 +16,23 @@ import OpenAI from "openai";
  * 客户端配置
  * ------------------------------------------------------------------------- */
 
-function getImageClient(): OpenAI {
-  const baseURL = process.env.IMAGE_BASE_URL?.trim();
-  const apiKey = process.env.IMAGE_API_KEY?.trim();
-  if (!baseURL) {
-    throw new Error("IMAGE_BASE_URL 未配置。请在 .env 中设置 IMAGE_BASE_URL。");
-  }
-  if (!apiKey) {
-    throw new Error("IMAGE_API_KEY 未配置。请在 .env 中设置 IMAGE_API_KEY。");
-  }
-  return new OpenAI({ baseURL, apiKey });
-}
-
 function resolveImageModel(): string {
   const fromEnv = process.env.IMAGE_MODEL?.trim();
   return fromEnv && fromEnv.length > 0 ? fromEnv : "Tongyi-MAI/Z-Image-Turbo";
+}
+
+/** 与 VideoPreview 导出一致的 16:9 画幅，可通过 IMAGE_SIZE 覆盖 */
+function resolveImageSize(): string {
+  const fromEnv = process.env.IMAGE_SIZE?.trim();
+  return fromEnv && fromEnv.length > 0 ? fromEnv : "1280x720";
+}
+
+const DEFAULT_NEGATIVE_PROMPT =
+  "text, watermark, logo, signature, blurry, low quality, deformed, extra limbs, bad anatomy, cropped, out of frame, cluttered border, split screen";
+
+function resolveNegativePrompt(): string {
+  const fromEnv = process.env.IMAGE_NEGATIVE_PROMPT?.trim();
+  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_NEGATIVE_PROMPT;
 }
 
 /* ---------------------------------------------------------------------------
@@ -77,9 +79,10 @@ export async function generateImage(
   const baseURL = process.env.IMAGE_BASE_URL?.trim()!;
   const apiKey = process.env.IMAGE_API_KEY?.trim()!;
   const model = resolveImageModel();
+  const size = resolveImageSize();
+  const negativePrompt = resolveNegativePrompt();
+  const finalPrompt = enrichPromptForImageGeneration(prompt);
 
-  // Step 1: 提交生成任务（带 async mode header）
-  // baseURL 末尾已是 /v1，需要加 / 再接 path
   const submitRes = await fetch(`${baseURL}/images/generations`, {
     method: "POST",
     headers: {
@@ -89,7 +92,9 @@ export async function generateImage(
     },
     body: JSON.stringify({
       model,
-      prompt,
+      prompt: finalPrompt,
+      size,
+      negative_prompt: negativePrompt,
     }),
   });
 

@@ -16,12 +16,12 @@ import {
   type RecordingHandle,
 } from "@/lib/recorder";
 import { WORKSPACE_BOTTOM_DOCK_HEIGHT, WORKSPACE_HEADER_HEIGHT } from "@/lib/workspaceLayout";
+import { countPendingGenerateTasks } from "@/lib/pendingGenerateTasks";
 import {
   deleteProjectAction,
   generateProjectAudiosAction,
   getChatHistoryAction,
   loadStoryboardAction,
-  regenerateSceneAudioAction,
   regenerateSceneImageAction,
   renameProjectAction,
 } from "@/app/actions";
@@ -238,9 +238,9 @@ export default function CreatePageClient({
         }
       }
       if (needAudio) {
-        const res = await regenerateSceneAudioAction(activeProjectId, sceneIndex);
+        const res = await generateProjectAudiosAction(activeProjectId);
         if (res.ok) setOutline(res.outline);
-        else console.error(`[handleGenerateScene] audio scene ${sceneIndex} failed:`, res.error);
+        else console.error("[handleGenerateScene] project audio failed:", res.error);
       }
     } catch (err) {
       console.error("[handleGenerateScene] failed:", err);
@@ -287,7 +287,10 @@ export default function CreatePageClient({
       }
     }
     const needsProjectAudio = baseScenes.some((sc) => !sc.audioPath);
-    const totalTasks = tasks.length + (needsProjectAudio ? 1 : 0);
+    const totalTasks = countPendingGenerateTasks(
+      baseScenes,
+      Boolean(isHtmlMode),
+    );
     if (totalTasks === 0) return;
 
     bulkAbortRef.current = false;
@@ -633,7 +636,7 @@ export default function CreatePageClient({
           role="dialog"
           aria-label="录制中"
         >
-          <div className="relative h-full w-full">
+          <div className="relative flex h-full w-full items-center justify-center bg-black">
             <VideoPreview
               key="recording"
               ref={videoPreviewRef}

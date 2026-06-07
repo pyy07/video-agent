@@ -10,7 +10,7 @@ export type SceneAudioSlice = {
 };
 
 /** 整片 TTS 在镜间换行处会有自然停顿，切分权重需补偿等效字数 */
-const SCENE_BOUNDARY_PAUSE_WEIGHT = 6;
+export const SCENE_BOUNDARY_PAUSE_WEIGHT = 6;
 
 /**
  * 按各镜旁白 visualLength 权重，把整段 mp3 时长切成连续时间片。
@@ -61,4 +61,20 @@ export function sceneAudioMapsFromSlices(slices: SceneAudioSlice[]): {
     totalSec = slice.startSec + slice.durationSec;
   }
   return { durations, starts, totalSec };
+}
+
+/**
+ * 分镜时间片内实际旁白朗读所占时长（扣除镜尾为换镜预留的停顿权重）。
+ * 字幕应用此值做分母，避免 sceneDuration 含停顿导致字幕落后于 TTS。
+ */
+export function speechDurationInSlice(
+  narration: string,
+  sliceDurationSec: number,
+  isLastScene: boolean,
+): number {
+  if (sliceDurationSec <= 0) return sliceDurationSec;
+  const textWeight = Math.max(1, visualLength(narration.trim()));
+  if (isLastScene) return sliceDurationSec;
+  const weighted = sliceDurationSec * (textWeight / (textWeight + SCENE_BOUNDARY_PAUSE_WEIGHT));
+  return Math.max(0.05, weighted);
 }

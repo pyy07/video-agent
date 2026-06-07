@@ -96,6 +96,25 @@ export function clauseIndexAt(clauses: NarrationClause[], ratio: number): number
   return Math.max(0, Math.min(clauses.length - 1, lo));
 }
 
+/** 字幕相对音频时钟的提前量（秒），补偿 TTS 略快于字数比例与 UI 刷新延迟 */
+export const SUBTITLE_AUDIO_LEAD_SEC = 0.28;
+
+/**
+ * 根据镜内已播时长选取字幕短句（比进度条用更偏前的时钟，避免语音领先字幕）。
+ */
+export function subtitleClauseIndexAt(
+  clauses: NarrationClause[],
+  elapsedSec: number,
+  speechDurationSec: number,
+): number {
+  if (clauses.length === 0 || speechDurationSec <= 0) return -1;
+  const ratio = Math.min(
+    1,
+    Math.max(0, (elapsedSec + SUBTITLE_AUDIO_LEAD_SEC) / speechDurationSec),
+  );
+  return clauseIndexAt(clauses, ratio);
+}
+
 /**
  * 中英混排"视觉字数"：
  * 用 Intl.Segmenter 拿到字素簇数（CJK 字符算 1，emoji 不会被错分成 2）。

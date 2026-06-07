@@ -12,7 +12,7 @@ export interface OutlineScene {
   narration: string;
   /**
    * 画面提示词：
-   *  - image 模式：英文图片生成提示词（subject / style / lighting / composition / palette）
+   *  - image 模式：最终英文图片 prompt（全局风格 + 本镜 subject，已拼装）
    *  - html 模式：中文网页动画规格（元素 / 动作 / 缓动 / 时长）
    */
   prompt: string;
@@ -38,9 +38,8 @@ export interface VideoOutline {
   /** 完整逐字稿（与 scenes 拆分的总集） */
   script: string;
   /**
-   * 全局画面风格提示词（仅 image 模式有值）。
-   * 由 AI 根据脚本内容自动生成，会 prepended 到每个分镜的 prompt 前面，
-   * 确保整组画面风格一致。
+   * 全局画面风格（仅 image 模式）。
+   * 归一化后的英文 prose；各分镜 prompt 由 buildSceneImagePrompt 与其拼接，勿重复堆叠。
    */
   globalStylePrompt?: string;
   /** 6..30 个分镜 */
