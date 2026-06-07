@@ -17,8 +17,9 @@ import { splitNarration, subtitleClauseIndexAt } from "@/lib/narration";
 import { projectAudioUrl, projectFullAudioUrl } from "@/lib/audioUrl";
 import {
   computeSceneAudioSlices,
+  resolvePlaybackClock,
   sceneAudioMapsFromSlices,
-  speechDurationInSlice,
+  subtitleSpeechDurationSec,
 } from "@/lib/audioSlices";
 import type { OutlineScene } from "@/lib/outlineTypes";
 import type { ProjectType } from "@/lib/projectTypes";
@@ -74,6 +75,12 @@ const RECORDING_W = 1920;
 const RECORDING_H = 1080;
 const RECORDING_FPS = 30;
 const RECORDING_FRAME_MS = 1000 / RECORDING_FPS;
+/** HTML 分镜 iframe 分批预载间隔（毫秒） */
+const HTML_IFRAME_PRELOAD_STAGGER_MS = 200;
+
+function sceneHtmlUrl(projectId: string, sceneIndex: number): string {
+  return `/api/project-scenes/${projectId}/${sceneIndex}.html`;
+}
 
 export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
   function VideoPreview(
@@ -171,6 +178,11 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     const fadeOutgoingSceneRef = useRef<OutlineScene | null>(null);
     /** 导出帧绘制：上次已稳定展示的镜序号，用于检测切镜并启动叠化 */
     const recordingLastSceneIndexRef = useRef(-1);
+    /** 整片 mp3 模式下，由音频时钟同步到的镜序号 */
+    const audioSyncedSceneIndexRef = useRef(-1);
+    /** 驱动字幕随 audio.timeupdate 刷新 */
+    const [subtitlePulse, setSubtitlePulse] = useState(0);
+    const lastProgressTimeRef = useRef(0);
     /** HTML 模式：getDisplayMedia 裁剪此区域 */
     const captureRegionRef = useRef<HTMLDivElement | null>(null);
 
@@ -260,24 +272,14 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         const fullDur = await loadFullAudioDuration();
         if (cancelled) return;
 
-        const hasPerSceneAudio = allScenes.every((s) => s.audioPath);
-
         if (fullDur && fullDur > 0) {
           useFullAudioRef.current = true;
-          // 优先用各镜 mp3 实测时长累加时间轴，与 ffmpeg 切分结果一致，避免字数估算提前切镜
-          if (hasPerSceneAudio) {
-            const measured = await loadPerSceneDurations();
-            if (cancelled) return;
-            setSceneDurations(measured.durations);
-            sceneStartSecRef.current = measured.starts;
-            setTotalDuration(Math.max(measured.totalSec, fullDur));
-          } else {
-            const slices = computeSceneAudioSlices(allScenes, fullDur);
-            const { durations, starts, totalSec } = sceneAudioMapsFromSlices(slices);
-            setSceneDurations(durations);
-            sceneStartSecRef.current = starts;
-            setTotalDuration(totalSec > 0 ? totalSec : fullDur);
-          }
+          // 与 ffmpeg 切分一致：整片 mp3 用 slice 算法，不用分镜 mp3 浏览器时长累加（易偏早切镜）
+          const slices = computeSceneAudioSlices(allScenes, fullDur);
+          const { durations, starts, totalSec } = sceneAudioMapsFromSlices(slices);
+          setSceneDurations(durations);
+          sceneStartSecRef.current = starts;
+          setTotalDuration(totalSec > 0 ? totalSec : fullDur);
           setSceneTimelineReady(true);
           return;
         }
@@ -430,7 +432,41 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setAudio(null);
     }, [audioGeneratedAt, projectId, handleFullAudioEnded, setAudio]);
 
-    // 切到下一个分镜（叠化过渡）
+    // 交叉叠化切到指定镜（整片 / 分镜 mp3 共用）
+    const beginCrossfadeToScene = useCallback(
+      (targetIndex: number, elapsedInScene: number) => {
+        const fromIndex = currentIndexRef.current;
+        if (targetIndex === fromIndex) {
+          sceneElapsedRef.current = elapsedInScene;
+          setCurrentTime(elapsedInScene);
+          return;
+        }
+
+        const outgoing = allScenes[fromIndex];
+        if (fadeoutTimerRef.current) clearTimeout(fadeoutTimerRef.current);
+
+        fadeStartedAtRef.current = performance.now();
+        fadeOutgoingSceneRef.current = outgoing ?? null;
+
+        setPrevScene(outgoing ?? null);
+        setPrevOpacity(1);
+        setCurrentIndex(targetIndex);
+        setCurrentOpacity(0);
+        sceneElapsedRef.current = elapsedInScene;
+        setCurrentTime(elapsedInScene);
+        audioSyncedSceneIndexRef.current = targetIndex;
+
+        fadeoutTimerRef.current = setTimeout(() => {
+          setPrevScene(null);
+          setPrevOpacity(1);
+          setCurrentOpacity(1);
+          fadeoutTimerRef.current = null;
+        }, FADE_DURATION_MS);
+      },
+      [allScenes],
+    );
+
+    // 切到下一个分镜（叠化过渡，仅分镜 mp3 逐镜播放时使用）
     const advanceToNext = useCallback(() => {
       clearAll();
       // 整片 mp3 连续播放，切镜时不暂停/重启音频
@@ -457,10 +493,12 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setPrevScene(outgoing ?? null);
       setPrevOpacity(1);
 
-      setCurrentIndex((i) => i + 1);
+      const nextIndex = currentIndex + 1;
+      setCurrentIndex(nextIndex);
       setCurrentTime(0);
       sceneElapsedRef.current = 0;
       setCurrentOpacity(0);
+      audioSyncedSceneIndexRef.current = nextIndex;
 
       fadeoutTimerRef.current = setTimeout(() => {
         setPrevScene(null);
@@ -469,6 +507,60 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         fadeoutTimerRef.current = null;
       }, FADE_DURATION_MS);
     }, [currentIndex, allScenes, clearAll, clearPrevLayer, recordingMode, onRecordingComplete]);
+
+    // 整片 mp3：按音频时钟同步镜序号与叠化，不切音频
+    const syncPlaybackFromAudioClock = useCallback(() => {
+      if (!isRunningRef.current) return;
+      const audio = audioRef.current;
+      if (!audio || !useFullAudioRef.current) return;
+
+      const clock = resolvePlaybackClock({
+        allScenes,
+        sceneDurations,
+        sceneStartSec: sceneStartSecRef.current,
+        useFullAudio: true,
+        audio,
+        currentIndex: currentIndexRef.current,
+        sceneElapsed: sceneElapsedRef.current,
+      });
+
+      sceneElapsedRef.current = clock.sceneElapsed;
+      const sceneChanged = clock.sceneIndex !== audioSyncedSceneIndexRef.current;
+      if (
+        sceneChanged ||
+        Math.abs(clock.sceneElapsed - lastProgressTimeRef.current) >= 0.08
+      ) {
+        lastProgressTimeRef.current = clock.sceneElapsed;
+        setCurrentTime(clock.sceneElapsed);
+      }
+
+      if (audioSyncedSceneIndexRef.current < 0) {
+        audioSyncedSceneIndexRef.current = clock.sceneIndex;
+        if (clock.sceneIndex !== currentIndexRef.current) {
+          setCurrentIndex(clock.sceneIndex);
+        }
+        return;
+      }
+
+      if (sceneChanged) {
+        beginCrossfadeToScene(clock.sceneIndex, clock.sceneElapsed);
+      }
+    }, [allScenes, sceneDurations, beginCrossfadeToScene]);
+
+    // 播放中：audio.timeupdate 驱动字幕刷新；整片 mp3 同时同步切镜（不用 setInterval 重复跑）
+    useEffect(() => {
+      if (!isPlaying) return;
+      const audio = audioRef.current;
+      if (!audio) return;
+      const onTimeUpdate = () => {
+        if (useFullAudioRef.current) {
+          syncPlaybackFromAudioClock();
+        }
+        setSubtitlePulse((n) => n + 1);
+      };
+      audio.addEventListener("timeupdate", onTimeUpdate);
+      return () => audio.removeEventListener("timeupdate", onTimeUpdate);
+    }, [isPlaying, syncPlaybackFromAudioClock, audioGeneratedAt]);
 
     // 开始播放进度：整片 mp3 用全局时钟；分镜 mp3 用当前镜 audio.currentTime 或定时器
     const startProgress = useCallback(() => {
@@ -482,6 +574,12 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       doneFiredRef.current = false;
 
       clearAll();
+
+      // 整片 mp3：切镜与进度由 audio.timeupdate 驱动，避免与 setInterval 双重 setState 卡顿
+      if (useFullAudioRef.current) {
+        syncPlaybackFromAudioClock();
+        return;
+      }
 
       const tick = () => {
         if (
@@ -499,12 +597,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         const dur = sceneDurations[sc.index] ?? DEFAULT_SCENE_DURATION;
         let elapsed: number;
 
-        if (useFullAudioRef.current) {
-          const audio = audioRef.current;
-          if (!audio) return;
-          const start = sceneStartSecRef.current[sc.index] ?? 0;
-          elapsed = audio.currentTime - start;
-        } else {
+        {
           const audio = audioRef.current;
           if (audio && sc.audioPath) {
             elapsed = audio.currentTime;
@@ -547,7 +640,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
 
       progressTimerRef.current = setInterval(tick, 50);
       tick();
-    }, [allScenes, sceneDurations, clearAll, advanceToNext, recordingMode, onRecordingComplete]);
+    }, [allScenes, sceneDurations, clearAll, advanceToNext, recordingMode, onRecordingComplete, syncPlaybackFromAudioClock]);
 
     // 播放/暂停
     const togglePlay = useCallback(() => {
@@ -558,6 +651,8 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         setIsPlaying(false);
       } else {
         if (allScenes.length === 0) return;
+        if (!sceneTimelineReady) return;
+        audioSyncedSceneIndexRef.current = -1;
         setIsPlaying(true);
         const sc = allScenes[currentIndex];
         if (sc) {
@@ -571,7 +666,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         }
         startProgress();
       }
-    }, [isPlaying, currentIndex, allScenes, playFullAudioFrom, playSceneAudio, startProgress, clearAll]);
+    }, [isPlaying, currentIndex, allScenes, playFullAudioFrom, playSceneAudio, startProgress, clearAll, sceneTimelineReady]);
 
     // 分镜切换时重启进度；首次点播放由 togglePlay 负责，避免重复 clearAll
     const prevPlayingIndexRef = useRef(currentIndex);
@@ -582,6 +677,9 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       }
       if (prevPlayingIndexRef.current === currentIndex) return;
       prevPlayingIndexRef.current = currentIndex;
+
+      // 整片 mp3：音频连续，切镜只换视觉层，不重启进度计时
+      if (useFullAudioRef.current) return;
 
       isRunningRef.current = false;
       clearAll();
@@ -614,6 +712,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setCurrentTime(0);
       clearPrevLayer();
       recordingLastSceneIndexRef.current = -1;
+      audioSyncedSceneIndexRef.current = -1;
       fadeStartedAtRef.current = null;
       fadeOutgoingSceneRef.current = null;
       if (allScenes.length === 0) {
@@ -692,6 +791,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setIsPlaying(false);
       setCurrentIndex(0);
       setCurrentTime(0);
+      audioSyncedSceneIndexRef.current = -1;
       clearPrevLayer();
     }, [clearAll, clearPrevLayer, setAudio]);
 
@@ -727,6 +827,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setCurrentIndex(targetIdx);
       setCurrentTime(sceneOffset);
       sceneElapsedRef.current = sceneOffset;
+      audioSyncedSceneIndexRef.current = targetIdx;
       clearPrevLayer();
     }, [allScenes, sceneDurations, totalDuration, clearAll, clearPrevLayer, setAudio]);
 
@@ -757,6 +858,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
 
     // 字幕：用镜内有效朗读时长 + 略提前的时钟，与 TTS 对齐
     const subtitleElapsed = (() => {
+      void subtitlePulse;
       if (!isPlaying && !recordingMode) return currentTime;
       const audio = audioRef.current;
       const sc = currentScene;
@@ -769,13 +871,12 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       return currentTime;
     })();
     const subtitleSpeechDuration = currentScene
-      ? useFullAudioRef.current
-        ? speechDurationInSlice(
-            currentScene.narration,
-            currentSceneDuration,
-            currentIndex >= allScenes.length - 1,
-          )
-        : currentSceneDuration
+      ? subtitleSpeechDurationSec(
+          currentScene.narration,
+          currentSceneDuration,
+          currentIndex >= allScenes.length - 1,
+          useFullAudioRef.current,
+        )
       : currentSceneDuration;
     const activeClauseIdx = subtitleClauseIndexAt(
       currentClauses,
@@ -891,14 +992,52 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
 
     if (!scene || allScenes.length === 0) return <EmptyPreview fillContainer={fillContainer} />;
 
+    const isHtmlRecording = recordingMode && isHtmlMode && fillContainer;
+
     return (
       <div
         className={
           fillContainer
-            ? "relative flex h-full min-h-0 flex-col gap-2"
+            ? isHtmlRecording
+              ? "relative flex h-full w-full min-h-0 flex-col bg-black"
+              : "relative flex h-full min-h-0 flex-col gap-2"
             : "relative space-y-3"
         }
       >
+        {isHtmlRecording ? (
+          <div className="flex h-full min-h-0 w-full items-center justify-center bg-black">
+            <div
+              ref={captureRegionRef}
+              className="relative aspect-video h-full w-auto max-w-full overflow-hidden bg-black"
+            >
+              <HtmlSceneLayers
+                allScenes={allScenes}
+                projectId={projectId}
+                currentIndex={currentIndex}
+                prevScene={prevScene}
+                currentOpacity={currentOpacity}
+                prevOpacity={prevOpacity}
+                sceneTimelineReady={sceneTimelineReady}
+              />
+              {showSubtitle && subtitleText && (
+                <div className="absolute inset-x-0 bottom-8 z-10 flex justify-center px-6 pointer-events-none">
+                  <span
+                    key={activeClauseIdx}
+                    className="max-w-[90%] rounded-md px-5 py-2 text-center text-lg font-semibold leading-snug text-white"
+                    style={{
+                      textShadow:
+                        "0 2px 6px rgba(0,0,0,0.85), 0 0 2px rgba(0,0,0,0.9), 0 1px 0 rgba(0,0,0,0.9), 0 -1px 0 rgba(0,0,0,0.9), 1px 0 0 rgba(0,0,0,0.9), -1px 0 0 rgba(0,0,0,0.9)",
+                      letterSpacing: "0.02em",
+                    }}
+                  >
+                    {subtitleText}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+        <>
         <div
           ref={captureRegionRef}
           className={
@@ -924,6 +1063,16 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
               className="h-full w-full"
               style={{ objectFit: "contain" }}
             />
+          ) : isHtmlMode ? (
+            <HtmlSceneLayers
+              allScenes={allScenes}
+              projectId={projectId}
+              currentIndex={currentIndex}
+              prevScene={prevScene}
+              currentOpacity={currentOpacity}
+              prevOpacity={prevOpacity}
+              sceneTimelineReady={sceneTimelineReady}
+            />
           ) : (
             <>
               {currentScene && (
@@ -932,7 +1081,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                   projectId={projectId}
                   opacity={currentOpacity}
                   fade={Boolean(prevScene)}
-                  isHtmlMode={isHtmlMode}
+                  isHtmlMode={false}
                 />
               )}
               {prevScene && (
@@ -942,7 +1091,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                   projectId={projectId}
                   opacity={prevOpacity}
                   fade
-                  isHtmlMode={isHtmlMode}
+                  isHtmlMode={false}
                 />
               )}
             </>
@@ -958,7 +1107,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             </div>
           )}
           {showSubtitle && subtitleText && (!recordingMode || isHtmlMode) && (
-            <div className="absolute inset-x-0 bottom-8 flex justify-center px-6 pointer-events-none">
+            <div className="absolute inset-x-0 bottom-8 z-10 flex justify-center px-6 pointer-events-none">
               <span
                 key={activeClauseIdx}
                 className="max-w-[90%] rounded-md px-5 py-2 text-center text-lg font-semibold leading-snug text-white"
@@ -973,7 +1122,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             </div>
           )}
         </div>
-        {recordingMode && (
+        {recordingMode && !isHtmlMode && (
           <div className="pointer-events-none absolute right-4 top-4 z-20 flex items-center gap-1.5 rounded-md bg-red-500/95 px-2 py-1 text-[11px] font-semibold text-white shadow-md backdrop-blur-sm">
             <span className="relative grid h-2 w-2 place-items-center">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-white/80" />
@@ -982,7 +1131,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             录制中
           </div>
         )}
-        {onRecordingCancel && recordingMode && (
+        {onRecordingCancel && recordingMode && !isHtmlMode && (
           <button
             type="button"
             onClick={onRecordingCancel}
@@ -1023,6 +1172,8 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             <Volume2 className="h-4 w-4" />
           </button>
         </div>
+        </>
+        )}
 
       </div>
     );
@@ -1030,11 +1181,6 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
 );
 
 // ===================== 录制帧绘制（图片轮播） =====================
-
-type PlaybackClock = {
-  sceneIndex: number;
-  sceneElapsed: number;
-};
 
 type SyncRecordingParams = {
   allScenes: OutlineScene[];
@@ -1096,14 +1242,14 @@ function syncRecordingRenderState(
   }
 
   const clauses = sc ? splitNarration(sc.narration) : [];
-  const speechDur =
-    sc && params.useFullAudio
-      ? speechDurationInSlice(
-          sc.narration,
-          dur,
-          clock.sceneIndex >= params.allScenes.length - 1,
-        )
-      : dur;
+  const speechDur = sc
+    ? subtitleSpeechDurationSec(
+        sc.narration,
+        dur,
+        clock.sceneIndex >= params.allScenes.length - 1,
+        params.useFullAudio,
+      )
+    : dur;
   const clauseIdx = subtitleClauseIndexAt(clauses, clock.sceneElapsed, speechDur);
   const subtitleText = clauseIdx >= 0 ? clauses[clauseIdx].text : "";
 
@@ -1116,33 +1262,6 @@ function syncRecordingRenderState(
     subtitleText,
     isHtmlMode: false,
   };
-}
-
-function resolvePlaybackClock(params: SyncRecordingParams): PlaybackClock {
-  const { allScenes, sceneDurations, sceneStartSec, useFullAudio, audio, currentIndex, sceneElapsed } =
-    params;
-
-  if (useFullAudio && audio) {
-    const globalTime = audio.currentTime;
-    for (let i = 0; i < allScenes.length; i++) {
-      const sc = allScenes[i];
-      const start = sceneStartSec[sc.index] ?? 0;
-      const dur = sceneDurations[sc.index] ?? DEFAULT_SCENE_DURATION;
-      if (globalTime < start + dur - 0.001 || i === allScenes.length - 1) {
-        return { sceneIndex: i, sceneElapsed: Math.max(0, globalTime - start) };
-      }
-    }
-    const lastIdx = allScenes.length - 1;
-    const lastSc = allScenes[lastIdx];
-    const start = sceneStartSec[lastSc.index] ?? 0;
-    return { sceneIndex: lastIdx, sceneElapsed: Math.max(0, globalTime - start) };
-  }
-
-  const sc = allScenes[currentIndex];
-  if (audio && sc?.audioPath) {
-    return { sceneIndex: currentIndex, sceneElapsed: audio.currentTime };
-  }
-  return { sceneIndex: currentIndex, sceneElapsed };
 }
 
 type RenderState = {
@@ -1371,6 +1490,151 @@ function hexToRgb(hex: string): [number, number, number] | null {
   if (!m) return null;
   const n = parseInt(m[1], 16);
   return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+}
+
+/**
+ * HTML 分镜层：fetch + 分批 iframe 预载全部分镜，切镜只切 opacity。
+ */
+function HtmlSceneLayers({
+  allScenes,
+  projectId,
+  currentIndex,
+  prevScene,
+  currentOpacity,
+  prevOpacity,
+  sceneTimelineReady,
+}: {
+  allScenes: OutlineScene[];
+  projectId: string | null;
+  currentIndex: number;
+  prevScene: OutlineScene | null;
+  currentOpacity: number;
+  prevOpacity: number;
+  sceneTimelineReady: boolean;
+}) {
+  const [mountedIndices, setMountedIndices] = useState<number[]>([]);
+  const prefetchStartedRef = useRef(false);
+
+  const htmlSceneIndices = useMemo(
+    () => allScenes.filter((s) => s.htmlPath).map((s) => s.index),
+    [allScenes],
+  );
+
+  // 1) fetch 预热 HTTP 缓存
+  useEffect(() => {
+    if (!projectId || !sceneTimelineReady || prefetchStartedRef.current) return;
+    prefetchStartedRef.current = true;
+    for (const idx of htmlSceneIndices) {
+      void fetch(sceneHtmlUrl(projectId, idx)).catch(() => undefined);
+    }
+  }, [projectId, sceneTimelineReady, htmlSceneIndices]);
+
+  // 2) 时间轴就绪后分批挂载 iframe（首镜优先，其余每 200ms 一个，只执行一次）
+  useEffect(() => {
+    if (!projectId || !sceneTimelineReady || htmlSceneIndices.length === 0) return;
+
+    const firstIdx = allScenes[0]?.index;
+    const ordered = [...htmlSceneIndices].sort((a, b) => {
+      if (firstIdx != null) {
+        if (a === firstIdx) return -1;
+        if (b === firstIdx) return 1;
+      }
+      return a - b;
+    });
+
+    let cancelled = false;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+
+    ordered.forEach((idx, i) => {
+      timers.push(
+        setTimeout(() => {
+          if (cancelled) return;
+          setMountedIndices((prev) =>
+            prev.includes(idx) ? prev : [...prev, idx].sort((x, y) => x - y),
+          );
+        }, i * HTML_IFRAME_PRELOAD_STAGGER_MS),
+      );
+    });
+
+    return () => {
+      cancelled = true;
+      timers.forEach(clearTimeout);
+    };
+  }, [projectId, sceneTimelineReady, htmlSceneIndices, allScenes]);
+
+  useEffect(() => {
+    if (!sceneTimelineReady) {
+      setMountedIndices([]);
+      prefetchStartedRef.current = false;
+    }
+  }, [sceneTimelineReady]);
+
+  // 3) 当前镜 / 叠化 outgoing 镜必须立刻在池中
+  useEffect(() => {
+    const urgent = new Set<number>();
+    const cur = allScenes[currentIndex];
+    if (cur?.htmlPath) urgent.add(cur.index);
+    if (prevScene?.htmlPath) urgent.add(prevScene.index);
+    if (urgent.size === 0) return;
+    setMountedIndices((prev) => {
+      const merged = new Set([...prev, ...urgent]);
+      return [...merged].sort((a, b) => a - b);
+    });
+  }, [allScenes, currentIndex, prevScene]);
+
+  return (
+    <>
+      {mountedIndices.map((sceneIndex) => {
+        const arrIdx = allScenes.findIndex((s) => s.index === sceneIndex);
+        if (arrIdx < 0 || !projectId) return null;
+        const sc = allScenes[arrIdx];
+        if (!sc.htmlPath) return null;
+
+        const isCurrent = arrIdx === currentIndex;
+        const isPrev = prevScene?.index === sceneIndex;
+        const isPreload = !isCurrent && !isPrev;
+
+        let opacity = 0;
+        let fade = false;
+        if (isPrev) {
+          opacity = prevOpacity;
+          fade = true;
+        } else if (isCurrent) {
+          opacity = currentOpacity;
+          fade = Boolean(prevScene);
+        }
+
+        const zIndex = isCurrent ? 2 : isPrev ? 1 : 0;
+        const url = sceneHtmlUrl(projectId, sceneIndex);
+
+        return (
+          <div
+            key={sceneIndex}
+            className="absolute inset-0"
+            style={{
+              opacity,
+              zIndex,
+              transition: fade ? `opacity ${FADE_DURATION_MS}ms ease-in-out` : undefined,
+              pointerEvents: opacity > 0 ? undefined : "none",
+              willChange: fade ? "opacity" : undefined,
+              transform: "translateZ(0)",
+              contentVisibility: isPreload ? "hidden" : "visible",
+            }}
+            aria-hidden={isPreload}
+            {...(isPreload ? { inert: true } : {})}
+          >
+            <iframe
+              src={url}
+              title={`分镜 ${sceneIndex} 网页动画`}
+              className="h-full w-full border-0"
+              sandbox="allow-scripts allow-same-origin"
+              tabIndex={-1}
+            />
+          </div>
+        );
+      })}
+    </>
+  );
 }
 
 function SceneLayer({

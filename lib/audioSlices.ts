@@ -78,3 +78,64 @@ export function speechDurationInSlice(
   const weighted = sliceDurationSec * (textWeight / (textWeight + SCENE_BOUNDARY_PAUSE_WEIGHT));
   return Math.max(0.05, weighted);
 }
+
+export type PlaybackClock = {
+  sceneIndex: number;
+  sceneElapsed: number;
+};
+
+export type ResolvePlaybackClockParams = {
+  allScenes: Pick<OutlineScene, "index">[];
+  sceneDurations: Record<number, number>;
+  sceneStartSec: Record<number, number>;
+  useFullAudio: boolean;
+  audio: HTMLAudioElement | null;
+  currentIndex: number;
+  sceneElapsed: number;
+};
+
+/**
+ * 根据整片 mp3 或分镜 mp3 时钟，解析当前应展示的镜序号与镜内已播时长。
+ * 整片模式以 slice 起始时间为准，与 ffmpeg 切分边界一致。
+ */
+export function resolvePlaybackClock(params: ResolvePlaybackClockParams): PlaybackClock {
+  const { allScenes, sceneDurations, sceneStartSec, useFullAudio, audio, currentIndex, sceneElapsed } =
+    params;
+
+  if (useFullAudio && audio) {
+    const globalTime = audio.currentTime;
+    for (let i = 0; i < allScenes.length; i++) {
+      const sc = allScenes[i];
+      const start = sceneStartSec[sc.index] ?? 0;
+      const dur = sceneDurations[sc.index] ?? 0;
+      const isLast = i === allScenes.length - 1;
+      const nextStart = isLast
+        ? start + dur
+        : (sceneStartSec[allScenes[i + 1].index] ?? start + dur);
+      if (globalTime < nextStart - 1e-4 || isLast) {
+        return { sceneIndex: i, sceneElapsed: Math.max(0, globalTime - start) };
+      }
+    }
+    const lastIdx = allScenes.length - 1;
+    const lastSc = allScenes[lastIdx];
+    const start = sceneStartSec[lastSc.index] ?? 0;
+    return { sceneIndex: lastIdx, sceneElapsed: Math.max(0, globalTime - start) };
+  }
+
+  const sc = allScenes[currentIndex];
+  if (audio && sc) {
+    return { sceneIndex: currentIndex, sceneElapsed: audio.currentTime };
+  }
+  return { sceneIndex: currentIndex, sceneElapsed };
+}
+
+/** 整片 mp3 模式下，镜内字幕应使用的有效朗读时长（扣除镜尾停顿权重） */
+export function subtitleSpeechDurationSec(
+  narration: string,
+  sliceDurationSec: number,
+  isLastScene: boolean,
+  useFullAudio: boolean,
+): number {
+  if (!useFullAudio) return sliceDurationSec;
+  return speechDurationInSlice(narration, sliceDurationSec, isLastScene);
+}

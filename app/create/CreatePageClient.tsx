@@ -632,11 +632,11 @@ export default function CreatePageClient({
           canvas 在该模式自动进入渲染循环，recorder 抓流即可。 */}
       {recordingMode && outline && (
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black"
+          className="fixed inset-0 z-[60] flex flex-col bg-black"
           role="dialog"
           aria-label="录制中"
         >
-          <div className="relative flex h-full w-full items-center justify-center bg-black">
+          <div className="relative min-h-0 flex-1">
             <VideoPreview
               key="recording"
               ref={videoPreviewRef}
@@ -655,6 +655,21 @@ export default function CreatePageClient({
               fillContainer
             />
           </div>
+          {projectType === "html" && (
+            <div className="flex shrink-0 items-center justify-between gap-3 border-t border-white/10 bg-black px-4 py-2 text-xs text-white/75">
+              <span className="flex items-center gap-2">
+                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" />
+                录制中 · 播完自动下载
+              </span>
+              <button
+                type="button"
+                onClick={handleRecordingCancel}
+                className="rounded-md px-2.5 py-1 text-white/90 transition hover:bg-white/10"
+              >
+                取消录制
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

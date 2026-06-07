@@ -10,7 +10,7 @@ import type { OutlineScene } from "./outlineTypes";
  * 流程（仅在 HTML 模式下调用）：
  *  1. 拼装 system prompt：明确"网页动画视频设计工程师"身份 + 写一份可直接运行的
  *     HTML 页面（包含 <style> 和 <script>）的要求
- *  2. user message：目标分镜的标题 / 旁白 / 画面提示词 + 上一镜的 HTML 代码（如果有）
+ *  2. user message：目标分镜的标题 / 旁白（仅作动画参考，禁止写入 HTML）/ 画面提示词 + 上一镜 HTML
  *  3. 解析返回：剥掉 Markdown 围栏 / ```html 围栏；如果 LLM 仍然回了一段解释就拿首段 <!DOCTYPE> 或 <html> 切出来
  *  4. 落到项目目录 <projectDir>/scenes/<index>.html
  *  5. 返回相对路径 scenes/<index>.html
@@ -26,24 +26,30 @@ import type { OutlineScene } from "./outlineTypes";
 const HTML_SYSTEM_PROMPT = `你是一个网页动画视频设计工程师。
 
 # 你的任务
-根据「目标分镜」的标题、旁白、画面提示词，输出一个完整、可直接运行的 HTML 页面（包含 <!DOCTYPE html>、<html>、<head>、<body>、内联 <style> 与 <script>），用来承载这一个分镜的网页动画。动画会被嵌入到视频播放器中自动循环播放，配合旁白音频。
+根据「目标分镜」的标题、旁白（仅作内容参考）、画面提示词，输出一个完整、可直接运行的 HTML 页面（包含 <!DOCTYPE html>、<html>、<head>、<body>、内联 <style> 与 <script>），用来承载这一个分镜的网页动画。动画会被嵌入到视频播放器中自动循环播放；**旁白由播放器单独播放并以字幕叠加，HTML 内不得出现旁白文字。**
 
 # 适用题材
-- 数学定理、几何证明、公式推导：优先用 SVG/Canvas 画图形、辅助线、标注，步骤按旁白顺序出现
+- 数学定理、几何证明、公式推导：优先用 SVG/Canvas 画图形、辅助线、标注，步骤按讲解逻辑顺序出现
 - 物理/流程演示：用箭头、时间轴、状态切换表达因果关系
-- 避免纯装饰性粒子背景，每一屏元素都要服务当前旁白
+- 避免纯装饰性粒子背景，每一屏元素都要服务当前分镜主题
 
 # 内容对齐（最重要）
-- 动画必须**可视化旁白正在讲的内容**：旁白提到的对象、过程、对比、比喻，都应在画面中有对应元素
+- 动画必须**可视化旁白正在讲的内容**（旁白仅作为你的理解参考，不要渲染到页面上）：旁白提到的对象、过程、对比、比喻，都应在画面中有对应**图形/图标/公式/标签**等元素
 - 若旁白在解释抽象概念，用图标/流程/标签/箭头/数字等辅助理解，不要只做无关背景特效
 - 画面提示词与旁白冲突时，以**旁白语义**为准
+
+# 禁止显示旁白（硬性要求）
+- **不要在 HTML 中写旁白全文、旁白句子、字幕条、解说词滚动文字**
+- 不要使用 \`.subtitle\`、\`.narration\`、\`.caption\` 等容器展示旁白；不要预留底部字幕区
+- 页面内文字仅限：**必要的数学符号、公式、几何标注、步骤序号、极短的图表标签**（如 "A"、"△ABC"、">"），且必须服务于动画演示本身
+- 分镜标题也不要作为大段说明文字铺在画面上
 
 # 输出要求
 1. **必须是完整 HTML 页面**：以 <!DOCTYPE html> 开头，以 </html> 结尾，包含 head 和 body
 2. **动画技术**：用 HTML + CSS（@keyframes / transition / transform / animation / filter）+ JS（setTimeout / requestAnimationFrame / Web Animations API）+ SVG / Canvas。多种技术可以组合使用
 3. **时长**：单镜动画时长 4-12 秒，循环播放；多个元素的起止时间错开，让画面"动起来"而不是一闪而过
 4. **视觉规格**：
-   - 根容器建议使用 class \`video-canvas\`（16:9，默认 \`aspect-ratio: 16/9\`）；内置标题/字幕容器可用 \`.header\`、\`.subtitle-container\`
+   - 根容器建议使用 class \`video-canvas\`（16:9，默认 \`aspect-ratio: 16/9\`）
    - 背景与画布比例遵循画面提示词
    - 配色 / 字体 / 风格基调用「上一个分镜的 HTML」作为参考，保持整组视频的视觉一致性
    - 元素要"在屏幕中"：不要让元素跑出可视区导致看不到
@@ -85,9 +91,9 @@ export async function generateSceneHtml(
   const parts: string[] = [];
   parts.push(`# 目标分镜`);
   parts.push(`标题：${scene.title}`);
-  parts.push(`旁白：${scene.narration}`);
+  parts.push(`旁白（仅供理解动画内容，禁止写入 HTML 页面）：${scene.narration}`);
   parts.push(`画面提示词（网页动画规格）：${scene.prompt}`);
-  parts.push(`内容对齐：动画必须直接可视化旁白中的核心概念，不要跑题。`);
+  parts.push(`内容对齐：动画用图形/公式/标注等可视化旁白核心概念，但页面上不要出现旁白原文或字幕条。`);
   parts.push("");
   if (previousHtml && previousIndex != null) {
     parts.push(`# 上一镜 HTML 参考（第 ${previousIndex} 镜）`);
