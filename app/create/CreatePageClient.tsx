@@ -834,7 +834,7 @@ function SplitWorkspace(props: {
               {!props.recordingMode ? (
                 <div className="min-h-0 flex-1">
                   <VideoPreview
-                    key={props.activeSceneId ?? "empty"}
+                    key={props.projectId ?? "empty"}
                     ref={props.videoPreviewRef}
                     scene={props.activeScene}
                     showSubtitle={props.subtitleOn}

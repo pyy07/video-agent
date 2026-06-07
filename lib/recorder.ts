@@ -239,6 +239,8 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
   const frameDurationUs = Math.round(1_000_000 / frameRate);
   let videoStopped = false;
   let frameCount = 0;
+  /** 保留 captureStream 原始时间戳，避免出帧抖动时被强行拉成固定 30fps 导致导出卡顿 */
+  let recordingOriginTs: number | null = null;
 
   const videoPumpWithKeyframes = async () => {
     try {
@@ -251,10 +253,15 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
           break;
         }
         const isKeyFrame = frameCount % keyframeIntervalFrames === 0;
-        const fixedTs = frameCount * frameDurationUs;
+        const rawTs = frame.timestamp;
+        if (recordingOriginTs === null) {
+          recordingOriginTs = rawTs;
+        }
+        const normalizedTs = Math.max(0, rawTs - recordingOriginTs);
+        const duration = frame.duration ?? frameDurationUs;
         const fixedFrame = new VideoFrame(frame, {
-          timestamp: fixedTs,
-          duration: frameDurationUs,
+          timestamp: normalizedTs,
+          duration,
         });
         frame.close();
         try {
