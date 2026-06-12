@@ -3,7 +3,6 @@ import "server-only";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { promisify } from "node:util";
 import { parseBuffer } from "music-metadata";
@@ -64,7 +63,7 @@ function resolveAudioSpeed(): number {
   return n;
 }
 
-function resolveFfmpegPath(): string {
+async function resolveFfmpegPath(): Promise<string> {
   const fromEnv = process.env.FFMPEG_BIN?.trim();
   if (fromEnv && existsSync(fromEnv)) return fromEnv;
 
@@ -72,9 +71,10 @@ function resolveFfmpegPath(): string {
   const direct = path.join(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg");
   if (existsSync(direct)) return direct;
 
-  const req = createRequire(path.join(process.cwd(), "package.json"));
-  const fromPkg = req("ffmpeg-static") as string | null;
-  if (fromPkg && existsSync(fromPkg)) return fromPkg;
+  // Use dynamic import() instead of createRequire to avoid ESM/CJS compatibility issues
+  const mod = await import("ffmpeg-static");
+  const ffmpegStaticPath = typeof mod === "string" ? mod : mod.default;
+  if (ffmpegStaticPath && existsSync(ffmpegStaticPath)) return ffmpegStaticPath;
 
   throw new Error("ffmpeg_static_missing: 无法找到 ffmpeg 可执行文件，请确认已安装 ffmpeg-static");
 }
@@ -209,7 +209,7 @@ async function splitMp3Segment(
   startSec: number,
   durationSec: number,
 ): Promise<void> {
-  const ffmpeg = resolveFfmpegPath();
+  const ffmpeg = await resolveFfmpegPath();
   await execFileAsync(ffmpeg, [
     "-hide_banner",
     "-loglevel",
