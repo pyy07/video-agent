@@ -1474,19 +1474,22 @@ function drawCoveredImage(
   h: number,
   img: HTMLImageElement,
 ): void {
+  // object-contain: 保持宽高比，完整显示在 w*h 区域内，多余留黑边
   const imgRatio = img.naturalWidth / img.naturalHeight;
   const canvasRatio = w / h;
   let drawW: number, drawH: number, drawX: number, drawY: number;
   if (imgRatio > canvasRatio) {
-    drawH = h;
-    drawW = h * imgRatio;
-    drawX = (w - drawW) / 2;
-    drawY = 0;
-  } else {
+    // 图片更宽 → 以宽为基准，垂直居中
     drawW = w;
     drawH = w / imgRatio;
     drawX = 0;
     drawY = (h - drawH) / 2;
+  } else {
+    // 图片更高 → 以高为基准，水平居中
+    drawH = h;
+    drawW = h * imgRatio;
+    drawX = (w - drawW) / 2;
+    drawY = 0;
   }
   ctx.drawImage(img, drawX, drawY, drawW, drawH);
 }
@@ -1859,7 +1862,7 @@ function SceneLayer({
           src={imageUrl}
           alt={`分镜 ${scene.index}`}
           fill
-          className="object-cover"
+          className="object-contain"
           unoptimized
         />
       </div>
