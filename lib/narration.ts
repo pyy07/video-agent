@@ -133,3 +133,10 @@ export function visualLength(s: string): number {
   }
   return [...s].length;
 }
+
+/** 根据旁白估算分镜时长（秒），与中文 TTS 语速大致匹配（约 4.2 字/秒） */
+export function estimateSceneDurationSec(narration: string): number {
+  const len = visualLength(narration.trim());
+  if (len <= 0) return 5;
+  return Math.max(4, Math.min(45, Math.ceil(len / 4.2)));
+}

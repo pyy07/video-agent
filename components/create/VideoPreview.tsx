@@ -14,7 +14,7 @@ import {
   type MutableRefObject,
 } from "react";
 import { pickSceneCover } from "./sceneCover";
-import { splitNarration, subtitleClauseIndexAt } from "@/lib/narration";
+import { splitNarration, subtitleClauseIndexAt, estimateSceneDurationSec } from "@/lib/narration";
 import { projectAudioUrl, projectFullAudioUrl } from "@/lib/audioUrl";
 import {
   computeSceneAudioSlices,
@@ -48,6 +48,8 @@ type VideoPreviewProps = {
   recordingMode?: boolean;
   /** 父级 recorder 就绪后再自动播放，避免 recorder 还没连上 canvas 就开录 */
   recordingCaptureReady?: boolean;
+  /** 录屏预览开始播放时触发，用于音画时间轴对齐 */
+  onRecordingPlaybackStart?: () => void;
   /** canvas 每画完一帧时通知 recorder 抓帧 */
   onRecordingFrameDrawn?: () => void;
   onRecordingComplete?: () => void;
@@ -89,11 +91,65 @@ const RECORDING_FRAME_MS = 1000 / RECORDING_FPS;
 const HTML_IFRAME_PRELOAD_STAGGER_MS = 200;
 
 /** embed 注入逻辑变更时递增，避免浏览器 304 复用旧 HTML */
-const SCENE_EMBED_REV = 6;
+const SCENE_EMBED_REV = 8;
 
-function sceneHtmlUrl(projectId: string, sceneIndex: number, videoSize: VideoSize): string {
+function sceneHtmlUrl(
+  projectId: string,
+  sceneIndex: number,
+  videoSize: VideoSize,
+  durationSec?: number,
+  run = false,
+): string {
   const logical = logicalCanvasSize(videoSize);
-  return `/api/project-scenes/${projectId}/${sceneIndex}.html?embed=1&lw=${logical.width}&lh=${logical.height}&ev=${SCENE_EMBED_REV}`;
+  const ds =
+    typeof durationSec === "number" && durationSec > 0
+      ? `&ds=${Math.round(durationSec)}`
+      : "";
+  const runQ = run ? "&run=1" : "";
+  return `/api/project-scenes/${projectId}/${sceneIndex}.html?embed=1&lw=${logical.width}&lh=${logical.height}&ev=${SCENE_EMBED_REV}${ds}${runQ}`;
+}
+
+function sceneDurationSec(scene: OutlineScene | undefined): number | undefined {
+  if (!scene) return undefined;
+  if (typeof scene.durationSec === "number" && scene.durationSec > 0) {
+    return scene.durationSec;
+  }
+  if (scene.narration?.trim()) {
+    return estimateSceneDurationSec(scene.narration);
+  }
+  return undefined;
+}
+
+function effectiveSceneDurationSec(
+  scene: OutlineScene | undefined,
+  sceneDurations: Record<number, number>,
+): number | undefined {
+  if (!scene) return undefined;
+  const fromAudio = sceneDurations[scene.index];
+  if (typeof fromAudio === "number" && fromAudio > 0) {
+    return fromAudio;
+  }
+  return sceneDurationSec(scene);
+}
+
+/** 叠加字幕（字号随画幅容器缩放，带描边） */
+function SubtitleOverlay({ text, clauseKey }: { text: string; clauseKey: number }) {
+  return (
+    <div className="absolute inset-x-0 bottom-[3cqh] z-10 flex justify-center px-[3cqw] pointer-events-none">
+      <span
+        key={clauseKey}
+        className="max-w-[90%] px-[1.5cqw] py-[0.6cqh] text-center font-bold leading-snug text-white"
+        style={{
+          fontSize: "6cqh",
+          WebkitTextStroke: "0.55cqh rgba(0,0,0,0.95)",
+          paintOrder: "stroke fill",
+          letterSpacing: "0.02em",
+        }}
+      >
+        {text}
+      </span>
+    </div>
+  );
 }
 
 export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
@@ -107,6 +163,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       projectType,
       recordingMode = false,
       recordingCaptureReady = true,
+      onRecordingPlaybackStart,
       onRecordingFrameDrawn,
       onRecordingComplete,
       onRecordingCancel,
@@ -358,14 +415,16 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     }, []);
 
     const handleFullAudioEnded = useCallback(() => {
-      isRunningRef.current = false;
-      setIsPlaying(false);
-      setCurrentIndex(0);
-      setCurrentTime(0);
-      clearPrevLayer();
       if (recordingMode) {
         onRecordingComplete?.();
       }
+      isRunningRef.current = false;
+      setIsPlaying(false);
+      if (!recordingMode) {
+        setCurrentIndex(0);
+        setCurrentTime(0);
+      }
+      clearPrevLayer();
     }, [clearPrevLayer, recordingMode, onRecordingComplete]);
 
     // 播放整片 mp3 并从指定时间点开始（分镜切换时不重启，保证语调连贯）
@@ -513,13 +572,13 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       if (currentIndex >= allScenes.length - 1) {
         isRunningRef.current = false;
         setIsPlaying(false);
-        setCurrentIndex(0);
-        setCurrentTime(0);
-        sceneElapsedRef.current = 0;
-        clearPrevLayer();
-        // 录屏模式：所有镜播完，通知父级结束录屏
         if (recordingMode) {
           onRecordingComplete?.();
+        } else {
+          setCurrentIndex(0);
+          setCurrentTime(0);
+          sceneElapsedRef.current = 0;
+          clearPrevLayer();
         }
         return;
       }
@@ -760,6 +819,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         onRecordingComplete?.();
         return;
       }
+      onRecordingPlaybackStart?.();
       setIsPlaying(true);
       if (useFullAudioRef.current) {
         playFullAudioFrom(0);
@@ -1049,39 +1109,30 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             <div
               ref={captureRegionRef}
               data-recording-capture="1"
-              className="relative shrink-0 overflow-hidden bg-black"
+              className="relative shrink-0 overflow-hidden bg-black [container-type:size]"
               style={{
                 width: exportWidth,
                 height: exportHeight,
                 transform: `scale(${recordFitScale}) translateZ(0)`,
                 transformOrigin: "center center",
                 backfaceVisibility: "hidden",
+                isolation: "isolate",
               }}
             >
               <HtmlSceneLayers
                 allScenes={allScenes}
                 projectId={projectId}
                 videoSize={resolvedVideoSize}
+                sceneDurations={sceneDurations}
                 currentIndex={currentIndex}
                 prevScene={prevScene}
                 currentOpacity={currentOpacity}
                 prevOpacity={prevOpacity}
                 sceneTimelineReady={sceneTimelineReady}
+                recordingOnly
               />
               {showSubtitle && subtitleText && (
-                <div className="absolute inset-x-0 bottom-8 z-10 flex justify-center px-6 pointer-events-none">
-                  <span
-                    key={activeClauseIdx}
-                    className="max-w-[90%] rounded-md px-5 py-2 text-center text-lg font-semibold leading-snug text-white"
-                    style={{
-                      textShadow:
-                        "0 2px 6px rgba(0,0,0,0.85), 0 0 2px rgba(0,0,0,0.9), 0 1px 0 rgba(0,0,0,0.9), 0 -1px 0 rgba(0,0,0,0.9), 1px 0 0 rgba(0,0,0,0.9), -1px 0 0 rgba(0,0,0,0.9)",
-                      letterSpacing: "0.02em",
-                    }}
-                  >
-                    {subtitleText}
-                  </span>
-                </div>
+                <SubtitleOverlay text={subtitleText} clauseKey={activeClauseIdx} />
               )}
             </div>
           </div>
@@ -1092,7 +1143,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             <div
               ref={captureRegionRef}
               className={clsx(
-                "relative overflow-hidden",
+                "relative overflow-hidden [container-type:size]",
                 exportPortrait ? "h-full w-auto max-w-full" : "h-auto w-full max-h-full",
               )}
               style={{ aspectRatio: exportAspectRatio }}
@@ -1101,6 +1152,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                 allScenes={allScenes}
                 projectId={projectId}
                 videoSize={resolvedVideoSize}
+                sceneDurations={sceneDurations}
                 currentIndex={currentIndex}
                 prevScene={prevScene}
                 currentOpacity={currentOpacity}
@@ -1108,19 +1160,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                 sceneTimelineReady={sceneTimelineReady}
               />
               {showSubtitle && subtitleText && (
-                <div className="absolute inset-x-0 bottom-8 z-10 flex justify-center px-6 pointer-events-none">
-                  <span
-                    key={activeClauseIdx}
-                    className="max-w-[90%] rounded-md px-5 py-2 text-center text-lg font-semibold leading-snug text-white"
-                    style={{
-                      textShadow:
-                        "0 2px 6px rgba(0,0,0,0.85), 0 0 2px rgba(0,0,0,0.9), 0 1px 0 rgba(0,0,0,0.9), 0 -1px 0 rgba(0,0,0,0.9), 1px 0 0 rgba(0,0,0,0.9), -1px 0 0 rgba(0,0,0,0.9)",
-                      letterSpacing: "0.02em",
-                    }}
-                  >
-                    {subtitleText}
-                  </span>
-                </div>
+                <SubtitleOverlay text={subtitleText} clauseKey={activeClauseIdx} />
               )}
               <div className="absolute left-4 top-4 flex items-center gap-1.5">
                 <span className="rounded-md bg-black/40 px-2 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
@@ -1138,11 +1178,11 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
           className={
             fillContainer
               ? recordingMode && !isHtmlMode
-                  ? "relative mx-auto flex aspect-video w-full max-h-full items-center justify-center overflow-hidden rounded-xl bg-black shadow-soft"
-                  : "relative w-full flex-1 overflow-hidden rounded-xl shadow-soft"
+                  ? "relative mx-auto flex aspect-video w-full max-h-full items-center justify-center overflow-hidden rounded-xl bg-black shadow-soft [container-type:size]"
+                  : "relative w-full flex-1 overflow-hidden rounded-xl shadow-soft [container-type:size]"
               : exportPortrait
-                ? "relative mx-auto aspect-[9/16] h-[420px] w-auto max-w-full overflow-hidden rounded-xl shadow-soft"
-              : "relative h-[420px] w-full overflow-hidden rounded-xl shadow-soft"
+                ? "relative mx-auto aspect-[9/16] h-[420px] w-auto max-w-full overflow-hidden rounded-xl shadow-soft [container-type:size]"
+              : "relative h-[420px] w-full overflow-hidden rounded-xl shadow-soft [container-type:size]"
           }
         >
           {recordingMode && !isHtmlMode ? (
@@ -1158,6 +1198,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
               allScenes={allScenes}
               projectId={projectId}
               videoSize={resolvedVideoSize}
+              sceneDurations={sceneDurations}
               currentIndex={currentIndex}
               prevScene={prevScene}
               currentOpacity={currentOpacity}
@@ -1171,6 +1212,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                   scene={currentScene}
                   projectId={projectId}
                   videoSize={resolvedVideoSize}
+                  sceneDurations={sceneDurations}
                   opacity={currentOpacity}
                   fade={Boolean(prevScene)}
                   isHtmlMode={false}
@@ -1182,6 +1224,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                   scene={prevScene}
                   projectId={projectId}
                   videoSize={resolvedVideoSize}
+                  sceneDurations={sceneDurations}
                   opacity={prevOpacity}
                   fade
                   isHtmlMode={false}
@@ -1200,19 +1243,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             </div>
           )}
           {showSubtitle && subtitleText && (!recordingMode || isHtmlMode) && (
-            <div className="absolute inset-x-0 bottom-8 z-10 flex justify-center px-6 pointer-events-none">
-              <span
-                key={activeClauseIdx}
-                className="max-w-[90%] rounded-md px-5 py-2 text-center text-lg font-semibold leading-snug text-white"
-                style={{
-                  textShadow:
-                    "0 2px 6px rgba(0,0,0,0.85), 0 0 2px rgba(0,0,0,0.9), 0 1px 0 rgba(0,0,0,0.9), 0 -1px 0 rgba(0,0,0,0.9), 1px 0 0 rgba(0,0,0,0.9), -1px 0 0 rgba(0,0,0,0.9)",
-                  letterSpacing: "0.02em",
-                }}
-              >
-                {subtitleText}
-              </span>
-            </div>
+            <SubtitleOverlay text={subtitleText} clauseKey={activeClauseIdx} />
           )}
         </div>
         )}
@@ -1556,16 +1587,19 @@ function drawBadge(ctx: CanvasRenderingContext2D, w: number, text: string, x: nu
 }
 
 function drawSubtitle(ctx: CanvasRenderingContext2D, w: number, h: number, text: string): void {
+  const fontSize = Math.round(h * 0.06);
+  const strokeWidth = Math.max(3, Math.round(h * 0.0055));
+  const y = h - Math.round(h * 0.09);
   ctx.save();
-  ctx.font = "600 36px sans-serif";
+  ctx.font = `700 ${fontSize}px sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  // 描边
-  ctx.lineWidth = 6;
-  ctx.strokeStyle = "rgba(0,0,0,0.9)";
-  ctx.strokeText(text, w / 2, h - 100);
+  ctx.lineWidth = strokeWidth;
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "rgba(0,0,0,0.95)";
+  ctx.strokeText(text, w / 2, y);
   ctx.fillStyle = "#fff";
-  ctx.fillText(text, w / 2, h - 100);
+  ctx.fillText(text, w / 2, y);
   ctx.restore();
 }
 
@@ -1593,20 +1627,25 @@ function HtmlSceneLayers({
   allScenes,
   projectId,
   videoSize,
+  sceneDurations,
   currentIndex,
   prevScene,
   currentOpacity,
   prevOpacity,
   sceneTimelineReady,
+  recordingOnly = false,
 }: {
   allScenes: OutlineScene[];
   projectId: string | null;
   videoSize: VideoSize;
+  sceneDurations: Record<number, number>;
   currentIndex: number;
   prevScene: OutlineScene | null;
   currentOpacity: number;
   prevOpacity: number;
   sceneTimelineReady: boolean;
+  /** 录制模式：仅挂载当前镜与叠化 outgoing 镜，避免隐藏 iframe 叠层拖影 */
+  recordingOnly?: boolean;
 }) {
   const [mountedIndices, setMountedIndices] = useState<number[]>([]);
   const prefetchStartedRef = useRef(false);
@@ -1621,13 +1660,18 @@ function HtmlSceneLayers({
     if (!projectId || !sceneTimelineReady || prefetchStartedRef.current) return;
     prefetchStartedRef.current = true;
     for (const idx of htmlSceneIndices) {
-      void fetch(sceneHtmlUrl(projectId, idx, videoSize)).catch(() => undefined);
+      const sc = allScenes.find((s) => s.index === idx);
+      void fetch(
+        sceneHtmlUrl(projectId, idx, videoSize, effectiveSceneDurationSec(sc, sceneDurations)),
+      ).catch(() => undefined);
     }
-  }, [projectId, sceneTimelineReady, htmlSceneIndices, videoSize]);
+  }, [projectId, sceneTimelineReady, htmlSceneIndices, videoSize, allScenes, sceneDurations]);
 
   // 2) 时间轴就绪后分批挂载 iframe（首镜优先，其余每 200ms 一个，只执行一次）
   useEffect(() => {
-    if (!projectId || !sceneTimelineReady || htmlSceneIndices.length === 0) return;
+    if (recordingOnly || !projectId || !sceneTimelineReady || htmlSceneIndices.length === 0) {
+      return;
+    }
 
     const firstIdx = allScenes[0]?.index;
     const ordered = [...htmlSceneIndices].sort((a, b) => {
@@ -1656,7 +1700,7 @@ function HtmlSceneLayers({
       cancelled = true;
       timers.forEach(clearTimeout);
     };
-  }, [projectId, sceneTimelineReady, htmlSceneIndices, allScenes]);
+  }, [projectId, sceneTimelineReady, htmlSceneIndices, allScenes, recordingOnly]);
 
   useEffect(() => {
     if (!sceneTimelineReady) {
@@ -1678,9 +1722,20 @@ function HtmlSceneLayers({
     });
   }, [allScenes, currentIndex, prevScene]);
 
+  const renderIndices = useMemo(() => {
+    if (!recordingOnly) return mountedIndices;
+    const indices = new Set<number>();
+    const cur = allScenes[currentIndex];
+    if (cur?.htmlPath) indices.add(cur.index);
+    if (prevScene?.htmlPath) indices.add(prevScene.index);
+    const next = allScenes[currentIndex + 1];
+    if (next?.htmlPath) indices.add(next.index);
+    return [...indices].sort((a, b) => a - b);
+  }, [recordingOnly, mountedIndices, allScenes, currentIndex, prevScene]);
+
   return (
     <>
-      {mountedIndices.map((sceneIndex) => {
+      {renderIndices.map((sceneIndex) => {
         const arrIdx = allScenes.findIndex((s) => s.index === sceneIndex);
         if (arrIdx < 0 || !projectId) return null;
         const sc = allScenes[arrIdx];
@@ -1701,7 +1756,9 @@ function HtmlSceneLayers({
         }
 
         const zIndex = isCurrent ? 2 : isPrev ? 1 : 0;
-        const url = sceneHtmlUrl(projectId, sceneIndex, videoSize);
+        const dur = effectiveSceneDurationSec(sc, sceneDurations);
+        const shouldRun = isCurrent || isPrev;
+        const url = sceneHtmlUrl(projectId, sceneIndex, videoSize, dur, shouldRun);
 
         return (
           <div
@@ -1710,16 +1767,17 @@ function HtmlSceneLayers({
             style={{
               opacity,
               zIndex,
-              transition: fade ? `opacity ${FADE_DURATION_MS}ms ease-in-out` : undefined,
+              transition: fade && !recordingOnly ? `opacity ${FADE_DURATION_MS}ms ease-in-out` : undefined,
               pointerEvents: opacity > 0 ? undefined : "none",
-              willChange: fade ? "opacity" : undefined,
-              transform: "translateZ(0)",
+              willChange: !recordingOnly && fade ? "opacity" : undefined,
+              transform: recordingOnly ? undefined : "translateZ(0)",
               contentVisibility: isPreload ? "hidden" : "visible",
             }}
             aria-hidden={isPreload}
             {...(isPreload ? { inert: true } : {})}
           >
             <iframe
+              key={shouldRun ? `${sceneIndex}-run` : `${sceneIndex}-hold`}
               src={url}
               title={`分镜 ${sceneIndex} 网页动画`}
               className="h-full w-full border-0"
@@ -1734,11 +1792,12 @@ function HtmlSceneLayers({
 }
 
 function SceneLayer({
-  scene, projectId, videoSize, opacity, fade, isHtmlMode,
+  scene, projectId, videoSize, sceneDurations, opacity, fade, isHtmlMode,
 }: {
   scene: OutlineScene;
   projectId: string | null;
   videoSize: VideoSize;
+  sceneDurations: Record<number, number>;
   opacity: number;
   fade: boolean;
   isHtmlMode: boolean;
@@ -1749,7 +1808,13 @@ function SceneLayer({
     ? `/api/project-images/${projectId}/${scene.index}.png`
     : null;
   const htmlUrl = hasHtml && projectId
-    ? sceneHtmlUrl(projectId, scene.index, videoSize)
+    ? sceneHtmlUrl(
+        projectId,
+        scene.index,
+        videoSize,
+        effectiveSceneDurationSec(scene, sceneDurations),
+        opacity > 0,
+      )
     : null;
   const cover = pickSceneCover(scene.index);
   const opacityTransition = fade ? `opacity ${FADE_DURATION_MS}ms ease-in-out` : undefined;

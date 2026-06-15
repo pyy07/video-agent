@@ -45,12 +45,30 @@ body {
   border: none !important;
   box-shadow: none !important;
 }
+/* 嵌入播放器：动画只播一次，结束后保持终态；无 run=1 时停在首帧 */
+.video-canvas *,
+.video-canvas *::before,
+.video-canvas *::after {
+  animation-iteration-count: 1 !important;
+  animation-fill-mode: forwards !important;
+}
+html:not([data-va-run="1"]) .video-canvas *,
+html:not([data-va-run="1"]) .video-canvas *::before,
+html:not([data-va-run="1"]) .video-canvas *::after {
+  animation-play-state: paused !important;
+}
 `;
 }
 
-export function buildSceneEmbedScript(logicalWidth: number, logicalHeight: number): string {
+export function buildSceneEmbedScript(
+  logicalWidth: number,
+  logicalHeight: number,
+  durationSec = 0,
+): string {
   return `(function(){
-var LW=${logicalWidth},LH=${logicalHeight};
+var LW=${logicalWidth},LH=${logicalHeight},DS=${Math.max(0, Math.round(durationSec))};
+var shouldRun=/[?&]run=1(?:&|$)/.test(location.search);
+if(shouldRun){document.documentElement.setAttribute("data-va-run","1");}
 var canvas=document.querySelector(".video-canvas");
 if(!canvas)return;
 var wrap=document.getElementById("video-agent-embed-wrap");
@@ -97,6 +115,19 @@ if(typeof ResizeObserver!=="undefined"){
   window.addEventListener("resize",fit);
 }
 fit();
+function freezeScene(){
+  try{
+    document.querySelectorAll(".video-canvas *").forEach(function(el){
+      el.style.animationPlayState="paused";
+    });
+    if(typeof document.getAnimations==="function"){
+      document.getAnimations().forEach(function(anim){
+        try{anim.pause();}catch(e){}
+      });
+    }
+  }catch(e){}
+}
+if(DS>0&&shouldRun){setTimeout(freezeScene,DS*1000);}
 })();`;
 }
 
@@ -104,10 +135,11 @@ export function injectSceneEmbedCss(
   html: string,
   logicalWidth = 1280,
   logicalHeight = 720,
+  durationSec = 0,
 ): string {
   if (html.includes(`id="${SCENE_EMBED_STYLE_ID}"`)) return html;
   const styleTag = `<style id="${SCENE_EMBED_STYLE_ID}">${buildSceneEmbedCss(logicalWidth, logicalHeight)}</style>`;
-  const scriptTag = `<script id="${SCENE_EMBED_SCRIPT_ID}">${buildSceneEmbedScript(logicalWidth, logicalHeight)}</script>`;
+  const scriptTag = `<script id="${SCENE_EMBED_SCRIPT_ID}">${buildSceneEmbedScript(logicalWidth, logicalHeight, durationSec)}</script>`;
   let result = html;
   if (/<\/head>/i.test(result)) {
     result = result.replace(/<\/head>/i, `${styleTag}\n</head>`);

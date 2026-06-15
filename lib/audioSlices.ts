@@ -17,14 +17,16 @@ export const SCENE_BOUNDARY_PAUSE_WEIGHT = 6;
  * 服务端 ffmpeg 切分与前端预览/字幕同步共用此算法。
  */
 export function computeSceneAudioSlices(
-  scenes: Pick<OutlineScene, "index" | "narration">[],
+  scenes: Pick<OutlineScene, "index" | "narration" | "durationSec">[],
   totalDurationSec: number,
 ): SceneAudioSlice[] {
   if (scenes.length === 0 || totalDurationSec <= 0) return [];
 
   const sorted = [...scenes].sort((a, b) => a.index - b.index);
   const weights = sorted.map((s, i) => {
-    const textWeight = Math.max(1, visualLength(s.narration.trim()));
+    const planned =
+      typeof s.durationSec === "number" && s.durationSec > 0 ? s.durationSec : 0;
+    const textWeight = planned > 0 ? planned : Math.max(1, visualLength(s.narration.trim()));
     const pauseWeight = i < sorted.length - 1 ? SCENE_BOUNDARY_PAUSE_WEIGHT : 0;
     return textWeight + pauseWeight;
   });

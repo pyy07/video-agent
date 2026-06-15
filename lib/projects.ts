@@ -4,6 +4,7 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/p
 import path from "node:path";
 import type { PersistedChatMessage } from "./chatTypes";
 import { INTENT_ACTIONS } from "./intents";
+import { estimateSceneDurationSec } from "./narration";
 import type { VideoOutline, OutlineScene } from "./outlineTypes";
 import { normalizeVideoSize, DEFAULT_VIDEO_SIZE, type VideoSize } from "./exportVideo";
 import {
@@ -545,6 +546,9 @@ export async function addScene(
     title,
     narration,
     prompt,
+    ...(outline.mode === "html"
+      ? { durationSec: estimateSceneDurationSec(narration) }
+      : {}),
   };
   outline.scenes.push(newScene);
   await saveStoryboard(uuid, outline);
@@ -572,6 +576,14 @@ function isVideoOutlineShape(value: unknown): value is VideoOutline {
     if (typeof sc.title !== "string" || sc.title.length === 0) return false;
     if (typeof sc.narration !== "string" || sc.narration.length === 0) return false;
     if (typeof sc.prompt !== "string" || sc.prompt.length === 0) return false;
+    if (
+      sc.durationSec != null &&
+      (typeof sc.durationSec !== "number" ||
+        !Number.isFinite(sc.durationSec) ||
+        sc.durationSec < 0)
+    ) {
+      return false;
+    }
   }
   return true;
 }

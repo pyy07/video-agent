@@ -9,6 +9,7 @@ import {
   videoSizeSpecForLlm,
   type VideoSize,
 } from "./exportVideo";
+import { estimateSceneDurationSec } from "./narration";
 
 /**
  * 分镜 HTML 动画生成器。
@@ -43,7 +44,7 @@ ${videoSizeSpecForLlm(videoSize)}
 ${layoutHint}
 
 # 你的任务
-根据「目标分镜」的标题、旁白（仅作内容参考）、画面提示词，输出一个完整、可直接运行的 HTML 页面（包含 <!DOCTYPE html>、<html>、<head>、<body>、内联 <style> 与 <script>），用来承载这一个分镜的网页动画。动画会被嵌入到视频播放器中自动循环播放；**旁白由播放器单独播放并以字幕叠加，HTML 内不得出现旁白文字。**
+根据「目标分镜」的标题、旁白（仅作内容参考）、画面提示词，输出一个完整、可直接运行的 HTML 页面（包含 <!DOCTYPE html>、<html>、<head>、<body>、内联 <style> 与 <script>），用来承载这一个分镜的网页动画。动画会被嵌入到视频播放器中**播放一次**；播完后停在最后一帧。**旁白由播放器单独播放并以字幕叠加，HTML 内不得出现旁白文字。**
 
 # 适用题材
 - 数学定理、几何证明、公式推导：优先用 SVG/Canvas 画图形、辅助线、标注，步骤按讲解逻辑顺序出现
@@ -64,14 +65,14 @@ ${layoutHint}
 # 输出要求
 1. **必须是完整 HTML 页面**：以 <!DOCTYPE html> 开头，以 </html> 结尾，包含 head 和 body
 2. **动画技术**：用 HTML + CSS（@keyframes / transition / transform / animation / filter）+ JS（setTimeout / requestAnimationFrame / Web Animations API）+ SVG / Canvas。多种技术可以组合使用
-3. **时长**：单镜动画时长 4-12 秒，循环播放；多个元素的起止时间错开，让画面"动起来"而不是一闪而过
+3. **时长**：单镜动画总时长必须等于用户给定的「分镜时长（秒）」；**禁止 loop / infinite / 循环重置**；播完后保持终态（CSS 使用 \`animation-fill-mode: forwards\`，JS 动画结束后停止并保持最后一帧）
 4. **视觉规格**：
    - 根容器必须使用 class \`video-canvas\`，宽高均为 100% 铺满视口（\`width: 100%; height: 100%\`），**不要**使用 \`max-width\` 限制
    - 逻辑画布比例 ${logical.width}/${logical.height}；凡使用 SVG 固定坐标，必须设置 \`viewBox="0 0 ${logical.width} ${logical.height}"\` 与 \`preserveAspectRatio="none"\`
    - 背景与画布比例遵循画面提示词与上方画幅
    - 配色 / 字体 / 风格基调用「上一个分镜的 HTML」作为参考，保持整组视频的视觉一致性
    - 元素要"在屏幕中"：不要让元素跑出可视区导致看不到
-5. **稳定运行**：动画要可循环（用 infinite 或在末尾加 reset），不要做 fetch / 外部资源引用
+5. **稳定运行**：动画只播放一次，不要使用 \`infinite\`；不要做 fetch / 外部资源引用
 6. **代码风格**：HTML / CSS / JS 写在同一个文件里，结构清晰；变量名 / 类名用英文
 7. **不要做的**：不要写说明文字、不要 Markdown 围栏、不要解释、不要把"示例"或"思路"作为注释残留到最终代码中
 
@@ -106,11 +107,13 @@ export async function generateSceneHtml(
   input: GenerateSceneHtmlInput,
 ): Promise<GenerateSceneHtmlResult> {
   const { projectId, scene, previousHtml, previousIndex, videoSize } = input;
+  const durationSec = scene.durationSec ?? estimateSceneDurationSec(scene.narration);
 
   // 1) 拼装 user message
   const parts: string[] = [];
   parts.push(`# 目标分镜`);
   parts.push(`标题：${scene.title}`);
+  parts.push(`分镜时长：${durationSec} 秒（动画必须在此时间内播完并停在终态，禁止循环）`);
   parts.push(`旁白（仅供理解动画内容，禁止写入 HTML 页面）：${scene.narration}`);
   parts.push(`画面提示词（网页动画规格）：${scene.prompt}`);
   parts.push(`内容对齐：动画用图形/公式/标注等可视化旁白核心概念，但页面上不要出现旁白原文或字幕条。`);

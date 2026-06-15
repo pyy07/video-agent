@@ -18,6 +18,10 @@ export interface OutlineScene {
    */
   prompt: string;
   /**
+   * 分镜时长（秒）：旁白朗读 + 动画完整播放；HTML 模式动画须与此对齐。
+   */
+  durationSec?: number;
+  /**
    * 生成的图片路径（相对于项目目录的路径，如 "images/1.png"）。
    * 仅在图片生成完成后填充。
    */

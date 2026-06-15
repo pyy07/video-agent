@@ -10,6 +10,7 @@ import type { VideoOutline, OutlineScene } from "./outlineTypes";
 import type { ProjectType } from "./projectTypes";
 import type { VideoSize } from "./exportVideo";
 import { videoSizeSpecForLlm } from "./exportVideo";
+import { estimateSceneDurationSec } from "./narration";
 
 /**
  * 视频大纲生成器。
@@ -140,11 +141,17 @@ ${videoSizeSpecForLlm(videoSize)}
 - **旁白对应画面**：动画必须展示本镜 narration 正在讲解的概念/对象/过程（如定理条件、辅助线、公式步骤），不要用无关背景动画糊弄
 - **屏幕元素**：屏幕上要出现哪些 HTML/CSS 元素（如 div / svg / canvas / 公式文字 / 几何图形）
 - **元素动作**：每个元素如何运动（位移 / 旋转 / 缩放 / 透明度 / 形变 / 路径），推导步骤要按顺序出现
-- **缓动与时长**：缓动函数（ease-in / ease-out / linear / cubic-bezier）与每个动作的持续时长（秒）
+- **缓动与时长**：缓动函数（ease-in / ease-out / linear / cubic-bezier）与每个动作的持续时长（秒）；**全镜动画总时长必须等于该镜 \`durationSec\`**
 - **整体氛围**：配色（主色 / 辅色 / 背景色）、字体、风格基调（极简 / 卡通 / 科幻 / 课堂板书 等）
 - **镜头与版式**：按上方画幅设计元素位置；竖屏优先上下排列，横屏可用左右分栏；字幕由播放器叠加，HTML 动画无需预留字幕区
 
-请把每个分镜的 \`prompt\` 写成一段连续的中文描述，描述清楚「画什么 + 怎么动 + 多长时间」，避免空泛形容词。`
+请把每个分镜的 \`prompt\` 写成一段连续的中文描述，描述清楚「画什么 + 怎么动 + 多长时间」，避免空泛形容词。
+
+# 时长规划（HTML 模式硬性要求）
+- 每个分镜必须输出 \`durationSec\`（整数秒，建议 4–30）
+- 估算：旁白中文约 **4–5 字/秒**；\`durationSec\` 须与 \`narration\` 字数匹配
+- 动画在 \`durationSec\` 内播完并停在终态，**禁止循环**；旁白读完时动画应刚好结束或已停在最后一帧
+- 全片 \`durationSec\` 之和应接近用户期望总时长；用户未指定时建议 **60–120 秒**`
       : `# 当前模式：图片轮播视频（适合人物传记、历史事件、文化科普等「画面 + 旁白讲解」）
 每个分镜的 \`prompt\` 字段**只写本镜主体画面的英文描述**（subject），不要重复全局风格（全局风格会由系统自动拼接一次）。
 
@@ -195,6 +202,7 @@ ${videoSizeSpecForLlm(videoSize)}
    - \`title\`: 短标题（不超过 20 字，概括本镜核心信息）
    - \`narration\`: 该分镜的旁白（与 script 中对应段一致）
    - \`prompt\`: 画面提示词（见下方模式说明；必须能回答「这一镜旁白在讲什么，画面应该看到什么」）
+   - \`durationSec\`: 该分镜时长（整数秒）；html 模式必填，image 模式可省略
 
 ${sizeBlock}
 
@@ -210,7 +218,7 @@ ${globalStyleNote}
 {
   "script": "完整逐字稿（中文）。多段用换行分隔。",
   "scenes": [
-    { "index": 1, "title": "...", "narration": "...", "prompt": "..." },
+    { "index": 1, "title": "...", "narration": "...", "prompt": "...", "durationSec": 8 },
     ...
   ]
 }
@@ -260,15 +268,21 @@ export function parseOutlineResponse(
       throw new Error(`outline_shape_invalid: scene[${i}] not an object`);
     }
     const s = v as Record<string, unknown>;
-    const index = s.index;
-    const title = s.title;
-    const narration = s.narration;
-    const prompt = s.prompt;
+    const indexRaw = s.index;
+    const index =
+      typeof indexRaw === "number" && Number.isInteger(indexRaw)
+        ? indexRaw
+        : typeof indexRaw === "string"
+          ? parseInt(indexRaw, 10)
+          : NaN;
+    let title = s.title;
+    if (typeof title === "number") title = String(title);
+    let narration = s.narration;
+    if (typeof narration === "number") narration = String(narration);
+    let prompt = s.prompt;
+    if (typeof prompt === "number") prompt = String(prompt);
     if (typeof index !== "number" || !Number.isInteger(index) || index < 1) {
       throw new Error(`outline_shape_invalid: scene[${i}].index invalid`);
-    }
-    if (typeof title !== "string" || title.trim().length === 0) {
-      throw new Error(`outline_shape_invalid: scene[${i}].title invalid`);
     }
     if (typeof narration !== "string" || narration.trim().length === 0) {
       throw new Error(`outline_shape_invalid: scene[${i}].narration invalid`);
@@ -276,6 +290,12 @@ export function parseOutlineResponse(
     if (typeof prompt !== "string" || prompt.trim().length === 0) {
       throw new Error(`outline_shape_invalid: scene[${i}].prompt invalid`);
     }
+    const narrationText = narration.trim();
+    const promptText = prompt.trim();
+    let titleText =
+      typeof title === "string" && title.trim().length > 0
+        ? title.trim()
+        : narrationText.slice(0, 20) || `分镜 ${index}`;
     // image 模式：全局风格 + 本镜 subject 只拼一次
     const normalizedGlobal =
       mode === "image" && globalStylePrompt
@@ -283,13 +303,30 @@ export function parseOutlineResponse(
         : "";
     const fullPrompt =
       mode === "image" && normalizedGlobal
-        ? buildSceneImagePrompt(normalizedGlobal, prompt.trim())
-        : prompt.trim();
+        ? buildSceneImagePrompt(normalizedGlobal, promptText)
+        : promptText;
+    let durationSec: number | undefined;
+    if (mode === "html") {
+      const rawDur = s.durationSec;
+      if (typeof rawDur === "number" && Number.isFinite(rawDur) && rawDur >= 2) {
+        durationSec = Math.max(2, Math.min(120, Math.round(rawDur)));
+      } else if (typeof rawDur === "string") {
+        const parsed = parseInt(rawDur, 10);
+        if (Number.isFinite(parsed) && parsed >= 2) {
+          durationSec = Math.max(2, Math.min(120, parsed));
+        } else {
+          durationSec = estimateSceneDurationSec(narrationText);
+        }
+      } else {
+        durationSec = estimateSceneDurationSec(narrationText);
+      }
+    }
     scenes.push({
       index,
-      title: title.slice(0, 80),
-      narration: narration.slice(0, 1000),
+      title: titleText.slice(0, 80),
+      narration: narrationText.slice(0, 1000),
       prompt: fullPrompt.slice(0, 2000),
+      ...(durationSec != null ? { durationSec } : {}),
     });
   }
   // 校验 index 密集：1..N 无空缺无重复

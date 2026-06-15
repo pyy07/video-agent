@@ -26,6 +26,8 @@ export interface RecordingHandle {
   stop(): Promise<{ blob: Blob; durationMs: number; width: number; height: number }>;
   cancel(): void;
   setAudioElement(audioEl: HTMLAudioElement | null): void;
+  /** 预览开始播放时调用，音画从此刻对齐（丢弃之前的采集帧/静音） */
+  markPlaybackStart(): void;
   /** canvas 手动出帧时调用；标签页采集模式下为空操作 */
   notifyFrameDrawn(): void;
 }
@@ -179,6 +181,8 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
     if (!outputCtx) {
       throw new Error("recorder_no_canvas: 无法创建合成画布");
     }
+    outputCtx.imageSmoothingEnabled = true;
+    outputCtx.imageSmoothingQuality = "high";
   }
 
   let encoderClosed = false;
@@ -192,6 +196,57 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
   let audioPumpPromise: Promise<void> = Promise.resolve();
   let audioChunkCount = 0;
   let connectedAudioEl: HTMLAudioElement | null = null;
+  let audioCaptureTrack: MediaStreamTrack | null = null;
+  let audioEncoderSampleRate = 0;
+  let audioEncoderChannels = 0;
+  /** 预览开始播放前丢弃帧/音频，避免 getDisplayMedia 等待期间音画错位 */
+  let playbackStarted = false;
+  let playbackStartWallMs = 0;
+  /** 视频时间戳与 audio.currentTime 对齐，保证音画同步 */
+  let lastEncodedVideoTsUs = 0;
+
+  const computeVideoTimestampUs = (): number => {
+    let ts: number;
+    const audioEl = connectedAudioEl;
+    if (audioEl && !audioEl.paused && Number.isFinite(audioEl.currentTime)) {
+      ts = Math.round(audioEl.currentTime * 1_000_000);
+    } else if (playbackStartWallMs > 0) {
+      ts = Math.round((performance.now() - playbackStartWallMs) * 1000);
+    } else {
+      ts = 0;
+    }
+    if (ts <= lastEncodedVideoTsUs) {
+      ts = lastEncodedVideoTsUs + 1;
+    }
+    lastEncodedVideoTsUs = ts;
+    return ts;
+  };
+
+  const ensureAudioEncoder = (data: AudioData): boolean => {
+    if (!audioEncoder) return false;
+    const sampleRate = data.sampleRate;
+    const numberOfChannels = data.numberOfChannels;
+    if (
+      audioEncoder.state === "unconfigured" ||
+      sampleRate !== audioEncoderSampleRate ||
+      numberOfChannels !== audioEncoderChannels
+    ) {
+      try {
+        audioEncoder.configure({
+          codec: "mp4a.40.2",
+          sampleRate,
+          numberOfChannels,
+          bitrate: 128_000,
+        });
+        audioEncoderSampleRate = sampleRate;
+        audioEncoderChannels = numberOfChannels;
+      } catch (e) {
+        console.error("[recorder] AudioEncoder.configure failed:", e);
+        return false;
+      }
+    }
+    return true;
+  };
 
   const startAudioPumpFor = (audioTrack: MediaStreamTrack) => {
     audioProcessor = new MediaStreamTrackProcessor({ track: audioTrack });
@@ -206,6 +261,18 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
           if (encoderClosed || !audioEncoder || audioEncoder.state === "closed") {
             data.close();
             break;
+          }
+          if (!playbackStarted) {
+            data.close();
+            continue;
+          }
+          if (data.numberOfFrames <= 0) {
+            data.close();
+            continue;
+          }
+          if (!ensureAudioEncoder(data)) {
+            data.close();
+            continue;
           }
           try {
             audioEncoder.encode(data);
@@ -242,12 +309,37 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
     }
   };
 
-  const disconnectElementSource = () => {
+  const disconnectAudioCapture = async () => {
+    await stopCurrentAudioPump();
     if (elementSource) {
       try { elementSource.disconnect(); } catch { /* ignore */ }
       elementSource = null;
     }
+    audioCaptureTrack = null;
     connectedAudioEl = null;
+  };
+
+  const attachAudioElement = async (audioEl: HTMLAudioElement) => {
+    if (connectedAudioEl === audioEl && audioCaptureTrack) {
+      return;
+    }
+    await disconnectAudioCapture();
+    connectedAudioEl = audioEl;
+
+    if (!audioContext || !mediaDest) return;
+    await audioContext.resume();
+    try {
+      elementSource = audioContext.createMediaElementSource(audioEl);
+      elementSource.connect(mediaDest);
+      elementSource.connect(audioContext.destination);
+      const track = mediaDest.stream.getAudioTracks()[0];
+      if (track) {
+        audioCaptureTrack = track;
+        startAudioPumpFor(track);
+      }
+    } catch (e) {
+      console.error("[recorder] createMediaElementSource failed:", e);
+    }
   };
 
   if (withAudio) {
@@ -269,49 +361,21 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
         console.error("[recorder] AudioEncoder error:", e);
       },
     });
-    audioEncoder.configure({
-      codec: "mp4a.40.2",
-      numberOfChannels: 2,
-      sampleRate: 48_000,
-      bitrate: 128_000,
-    });
-
-    startAudioPumpFor(destTrack);
   }
 
   const setAudioElement = (audioEl: HTMLAudioElement | null) => {
-    if (!withAudio || !audioContext || !mediaDest) return;
-
+    if (!withAudio) return;
     if (!audioEl) {
-      disconnectElementSource();
+      void disconnectAudioCapture();
       return;
     }
-
-    if (connectedAudioEl === audioEl && elementSource) {
-      void audioContext.resume();
-      return;
-    }
-
-    disconnectElementSource();
-
-    void audioContext.resume().then(() => {
-      try {
-        elementSource = audioContext!.createMediaElementSource(audioEl);
-        elementSource.connect(mediaDest!);
-        elementSource.connect(audioContext!.destination);
-        connectedAudioEl = audioEl;
-      } catch (e) {
-        console.error("[recorder] createMediaElementSource failed:", e);
-      }
-    });
+    void attachAudioElement(audioEl);
   };
 
   const keyframeIntervalFrames = frameRate;
   const frameDurationUs = Math.round(1_000_000 / frameRate);
   let videoStopped = false;
   let frameCount = 0;
-  /** 保留 captureStream 原始时间戳，避免出帧抖动时被强行拉成固定 30fps 导致导出卡顿 */
-  let recordingOriginTs: number | null = null;
 
   const videoPumpWithKeyframes = async () => {
     try {
@@ -323,13 +387,13 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
           frame.close();
           break;
         }
-        const isKeyFrame = frameCount % keyframeIntervalFrames === 0;
-        const rawTs = frame.timestamp;
-        if (recordingOriginTs === null) {
-          recordingOriginTs = rawTs;
+        if (!playbackStarted) {
+          frame.close();
+          continue;
         }
-        const normalizedTs = Math.max(0, rawTs - recordingOriginTs);
-        const duration = frame.duration ?? frameDurationUs;
+        const isKeyFrame = frameCount % keyframeIntervalFrames === 0;
+        const frameDuration = frame.duration ?? frameDurationUs;
+        const normalizedTs = computeVideoTimestampUs();
 
         let encodeFrame: VideoFrame;
         if (tabComposite && outputCanvas && outputCtx) {
@@ -343,9 +407,15 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
           outputCtx.fillRect(0, 0, outputWidth, outputHeight);
           outputCtx.drawImage(frame, x, y, w, h, 0, 0, outputWidth, outputHeight);
           frame.close();
-          encodeFrame = new VideoFrame(outputCanvas, { timestamp: normalizedTs, duration });
+          // 快照后再编码，避免下一帧覆盖画布时硬件编码器仍读取上一帧导致运动残影
+          const bitmap = await createImageBitmap(outputCanvas);
+          encodeFrame = new VideoFrame(bitmap, { timestamp: normalizedTs, duration: frameDuration });
+          bitmap.close();
         } else {
-          encodeFrame = new VideoFrame(frame, { timestamp: normalizedTs, duration });
+          encodeFrame = new VideoFrame(frame, {
+            timestamp: normalizedTs,
+            duration: frameDuration,
+          });
           frame.close();
         }
 
@@ -381,8 +451,7 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
 
     await videoPumpPromise;
 
-    disconnectElementSource();
-    await stopCurrentAudioPump();
+    await disconnectAudioCapture();
 
     try { await videoEncoder.flush(); } catch { /* ignore */ }
     try { videoEncoder.close(); } catch { /* ignore */ }
@@ -406,6 +475,11 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
           console.warn("[recorder] requestFrame failed:", e);
         }
       }
+    },
+    markPlaybackStart: () => {
+      playbackStarted = true;
+      playbackStartWallMs = performance.now();
+      lastEncodedVideoTsUs = 0;
     },
     setAudioElement,
     stop: async () => {
@@ -499,7 +573,7 @@ export async function startRecordingFromDisplayMedia(
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         displaySurface: "browser",
-        frameRate: { ideal: config.frameRate ?? 30 },
+        frameRate: { ideal: config.frameRate ?? 30, max: config.frameRate ?? 30 },
       },
       audio: false,
       preferCurrentTab: true,

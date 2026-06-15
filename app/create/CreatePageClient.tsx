@@ -704,6 +704,7 @@ export default function CreatePageClient({
               recordingMode
               recordingCaptureReady={recordingCaptureReady}
               onRecordingFrameDrawn={() => recordingFrameBridgeRef.current?.()}
+              onRecordingPlaybackStart={() => recordingHandleRef.current?.markPlaybackStart()}
               onRecordingComplete={handleRecordingComplete}
               onRecordingCancel={handleRecordingCancel}
               onAudioElementChange={handleAudioElementChange}

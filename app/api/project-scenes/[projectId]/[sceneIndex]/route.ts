@@ -67,9 +67,11 @@ export async function GET(
     const embed = reqUrl.searchParams.get("embed") === "1";
     let lw = Number(reqUrl.searchParams.get("lw") ?? "1280");
     let lh = Number(reqUrl.searchParams.get("lh") ?? "720");
+    let ds = Number(reqUrl.searchParams.get("ds") ?? "0");
     if (!Number.isFinite(lw) || lw < 1) lw = 1280;
     if (!Number.isFinite(lh) || lh < 1) lh = 720;
-    const html = embed ? injectSceneEmbedCss(rawHtml, lw, lh) : rawHtml;
+    if (!Number.isFinite(ds) || ds < 0) ds = 0;
+    const html = embed ? injectSceneEmbedCss(rawHtml, lw, lh, ds) : rawHtml;
     return new Response(html, {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
