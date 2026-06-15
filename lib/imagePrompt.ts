@@ -134,9 +134,15 @@ export function buildSceneImagePrompt(globalProse: string, sceneSubject: string)
   return (subject || global).slice(0, 2000);
 }
 
-/** 调用图片 API 前补充画幅提示（与 16:9 导出一致） */
-export function enrichPromptForImageGeneration(prompt: string): string {
+/** 调用图片 API 前补充画幅提示 */
+export function enrichPromptForImageGeneration(
+  prompt: string,
+  size?: { width: number; height: number },
+): string {
   const p = prompt.trim();
-  if (/16:9|widescreen|aspect ratio/i.test(p)) return p;
+  if (/16:9|9:16|aspect ratio|竖屏|横屏/i.test(p)) return p;
+  if (size && size.height > size.width) {
+    return `${p}, vertical 9:16 portrait aspect ratio, mobile full screen frame`;
+  }
   return `${p}, widescreen 16:9 aspect ratio, cinematic still frame`;
 }

@@ -2,6 +2,7 @@ import "server-only";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { enrichPromptForImageGeneration } from "./imagePrompt";
+import { imageSizeString, type VideoSize } from "./exportVideo";
 
 /**
  * ModelScope / z-image-turbo 图片生成模块。
@@ -58,6 +59,9 @@ export interface GenerateImageInput {
   projectId: string;
   sceneIndex: number;
   prompt: string;
+  /** 图片生成尺寸，如 1280x720；未传则用环境变量或默认横屏 */
+  imageSize?: string;
+  videoSize?: VideoSize;
 }
 
 export interface GenerateImageResult {
@@ -74,14 +78,14 @@ export interface GenerateImageResult {
 export async function generateImage(
   input: GenerateImageInput,
 ): Promise<GenerateImageResult> {
-  const { projectId, sceneIndex, prompt } = input;
+  const { projectId, sceneIndex, prompt, imageSize, videoSize } = input;
 
   const baseURL = process.env.IMAGE_BASE_URL?.trim()!;
   const apiKey = process.env.IMAGE_API_KEY?.trim()!;
   const model = resolveImageModel();
-  const size = resolveImageSize();
+  const size = imageSize ?? (videoSize ? imageSizeString(videoSize) : resolveImageSize());
   const negativePrompt = resolveNegativePrompt();
-  const finalPrompt = enrichPromptForImageGeneration(prompt);
+  const finalPrompt = enrichPromptForImageGeneration(prompt, videoSize);
 
   const submitRes = await fetch(`${baseURL}/images/generations`, {
     method: "POST",

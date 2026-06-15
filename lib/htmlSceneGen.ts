@@ -3,6 +3,12 @@ import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import { callLLMRaw } from "./ai";
 import type { OutlineScene } from "./outlineTypes";
+import {
+  isPortraitVideoSize,
+  logicalCanvasSize,
+  videoSizeSpecForLlm,
+  type VideoSize,
+} from "./exportVideo";
 
 /**
  * 分镜 HTML 动画生成器。
@@ -23,7 +29,18 @@ import type { OutlineScene } from "./outlineTypes";
  *  - 不依赖任何额外 SDK，纯字符串拼接 + 文件 IO
  */
 
-const HTML_SYSTEM_PROMPT = `你是一个网页动画视频设计工程师。
+function buildHtmlSystemPrompt(videoSize: VideoSize): string {
+  const logical = logicalCanvasSize(videoSize);
+  const portrait = isPortraitVideoSize(videoSize);
+  const layoutHint = portrait
+    ? "竖屏布局：元素纵向堆叠，字号偏大，避免左右并排多节点拓扑"
+    : "横屏布局：可使用左右分栏、横向拓扑与宽屏构图";
+
+  return `你是一个网页动画视频设计工程师。
+
+# 视频画幅（硬性）
+${videoSizeSpecForLlm(videoSize)}
+${layoutHint}
 
 # 你的任务
 根据「目标分镜」的标题、旁白（仅作内容参考）、画面提示词，输出一个完整、可直接运行的 HTML 页面（包含 <!DOCTYPE html>、<html>、<head>、<body>、内联 <style> 与 <script>），用来承载这一个分镜的网页动画。动画会被嵌入到视频播放器中自动循环播放；**旁白由播放器单独播放并以字幕叠加，HTML 内不得出现旁白文字。**
@@ -49,8 +66,9 @@ const HTML_SYSTEM_PROMPT = `你是一个网页动画视频设计工程师。
 2. **动画技术**：用 HTML + CSS（@keyframes / transition / transform / animation / filter）+ JS（setTimeout / requestAnimationFrame / Web Animations API）+ SVG / Canvas。多种技术可以组合使用
 3. **时长**：单镜动画时长 4-12 秒，循环播放；多个元素的起止时间错开，让画面"动起来"而不是一闪而过
 4. **视觉规格**：
-   - 根容器建议使用 class \`video-canvas\`（16:9，默认 \`aspect-ratio: 16/9\`）
-   - 背景与画布比例遵循画面提示词
+   - 根容器必须使用 class \`video-canvas\`，宽高均为 100% 铺满视口（\`width: 100%; height: 100%\`），**不要**使用 \`max-width\` 限制
+   - 逻辑画布比例 ${logical.width}/${logical.height}；凡使用 SVG 固定坐标，必须设置 \`viewBox="0 0 ${logical.width} ${logical.height}"\` 与 \`preserveAspectRatio="none"\`
+   - 背景与画布比例遵循画面提示词与上方画幅
    - 配色 / 字体 / 风格基调用「上一个分镜的 HTML」作为参考，保持整组视频的视觉一致性
    - 元素要"在屏幕中"：不要让元素跑出可视区导致看不到
 5. **稳定运行**：动画要可循环（用 infinite 或在末尾加 reset），不要做 fetch / 外部资源引用
@@ -65,10 +83,12 @@ const HTML_SYSTEM_PROMPT = `你是一个网页动画视频设计工程师。
 
 # 输出格式
 仅输出 HTML 代码本身，从 <!DOCTYPE html> 开头，到 </html> 结尾，前后不要有其他内容。`;
+}
 
 export interface GenerateSceneHtmlInput {
   projectId: string;
   scene: OutlineScene;
+  videoSize: VideoSize;
   /** 上一镜的 HTML（用于视觉风格延续），可选：第一镜时为 null */
   previousHtml: string | null;
   /** 上一镜的 index（调试 / 标识用），可选 */
@@ -85,7 +105,7 @@ export interface GenerateSceneHtmlResult {
 export async function generateSceneHtml(
   input: GenerateSceneHtmlInput,
 ): Promise<GenerateSceneHtmlResult> {
-  const { projectId, scene, previousHtml, previousIndex } = input;
+  const { projectId, scene, previousHtml, previousIndex, videoSize } = input;
 
   // 1) 拼装 user message
   const parts: string[] = [];
@@ -115,7 +135,7 @@ export async function generateSceneHtml(
   //    （开了 json_object 的话 LLM 会把整段 HTML 包成 {"html": "..."} 然后 \n
   //    还会被转义成字面字符，反而要写更多解析代码。）
   const raw = await callLLMRaw({
-    system: HTML_SYSTEM_PROMPT,
+    system: buildHtmlSystemPrompt(videoSize),
     messages: [{ role: "user", content: userContent }],
     jsonMode: false,
   });

@@ -2,33 +2,42 @@
  * WebCodecs + mp4-muxer 录屏引擎。
  *
  * 两种视频采集方式：
- *  - 图片轮播：隐藏 canvas 逐帧绘制 → captureStream（无 html-to-image）
- *  - HTML 动画：getDisplayMedia + CropTarget 抓取预览区像素（与浏览器渲染一致）
+ *  - 图片轮播：隐藏 canvas 逐帧绘制 → captureStream
+ *  - HTML 动画：getDisplayMedia 采标签页，按预览区 DOM 矩形裁切，固定输出项目画幅（如 1920×1080）
  *
  * 音轨统一走 Web Audio API 混流 HTMLAudioElement。
  */
 import { Muxer, ArrayBufferTarget } from "mp4-muxer";
+import { bitrateForExportSize } from "./exportVideo";
 
 /** 录屏引擎配置 */
 export interface RecorderConfig {
   frameRate?: number;
   videoBitrate?: number;
   withAudio?: boolean;
+  /** 目标输出宽度（像素） */
+  width?: number;
+  /** 目标输出高度（像素） */
+  height?: number;
 }
 
 /** 录屏引擎的对外句柄 */
 export interface RecordingHandle {
-  stop(): Promise<{ blob: Blob; durationMs: number }>;
+  stop(): Promise<{ blob: Blob; durationMs: number; width: number; height: number }>;
   cancel(): void;
   setAudioElement(audioEl: HTMLAudioElement | null): void;
   /** canvas 手动出帧时调用；标签页采集模式下为空操作 */
   notifyFrameDrawn(): void;
 }
 
-type CropTargetFactory = { fromElement(el: Element): Promise<unknown> };
-
 type BuildRecordingParams = {
-  videoTrack: MediaStreamTrack;
+  /** 直连视频轨（canvas captureStream） */
+  videoTrack?: MediaStreamTrack;
+  /** 标签页采集：每帧从 tab 画面裁切预览区，合成到固定画幅 */
+  tabComposite?: {
+    tabTrack: MediaStreamTrack;
+    getCropRect: () => DOMRectReadOnly;
+  };
   width: number;
   height: number;
   config: RecorderConfig;
@@ -44,16 +53,47 @@ type DisplayMediaConstraints = MediaStreamConstraints & {
   surfaceSwitching?: "include" | "exclude";
 };
 
+/** 将预览区 DOM 矩形映射到标签页视频帧像素坐标 */
+function mapDomRectToFrameRect(
+  rect: DOMRectReadOnly,
+  frameW: number,
+  frameH: number,
+): { x: number; y: number; w: number; h: number } {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const scaleX = frameW / vw;
+  const scaleY = frameH / vh;
+  const x = Math.max(0, Math.round(rect.left * scaleX));
+  const y = Math.max(0, Math.round(rect.top * scaleY));
+  const w = Math.max(1, Math.min(frameW - x, Math.round(rect.width * scaleX)));
+  const h = Math.max(1, Math.min(frameH - y, Math.round(rect.height * scaleY)));
+  return { x, y, w, h };
+}
+
 async function buildRecordingHandle(params: BuildRecordingParams): Promise<RecordingHandle> {
-  const { videoTrack, width, height, config, requestManualFrame, onCleanup } = params;
+  const { videoTrack, tabComposite, width, height, config, requestManualFrame, onCleanup } =
+    params;
+  if (!videoTrack && !tabComposite) {
+    throw new Error("recorder_no_source: 未指定视频来源");
+  }
+  if (videoTrack && tabComposite) {
+    throw new Error("recorder_dual_source: 不能同时指定直连轨与标签页合成");
+  }
+
   const frameRate = config.frameRate ?? 30;
-  const videoBitrate = config.videoBitrate ?? 5_000_000;
+  const outputWidth = width;
+  const outputHeight = height;
+  if (outputWidth < 2 || outputHeight < 2) {
+    throw new Error(`recorder_invalid_size: 无效输出尺寸 ${outputWidth}×${outputHeight}`);
+  }
+  const videoBitrate =
+    config.videoBitrate ?? bitrateForExportSize(outputWidth, outputHeight);
   const withAudio = config.withAudio !== false;
 
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     fastStart: "in-memory",
-    video: { codec: "avc", width, height, frameRate },
+    video: { codec: "avc", width: outputWidth, height: outputHeight, frameRate },
     audio: withAudio ? { codec: "aac", numberOfChannels: 2, sampleRate: 48_000 } : undefined,
     firstTimestampBehavior: "offset",
   });
@@ -97,18 +137,49 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
       console.error("[recorder] VideoEncoder error:", e);
     },
   });
-  videoEncoder.configure({
+  const encoderConfig: VideoEncoderConfig = {
     codec: "avc1.640033",
-    width,
-    height,
+    width: outputWidth,
+    height: outputHeight,
     bitrate: videoBitrate,
     framerate: frameRate,
-    latencyMode: "realtime",
+    latencyMode: "quality",
+    bitrateMode: "variable",
+    hardwareAcceleration: "prefer-hardware",
     colorSpace: VIDEO_COLOR_SPACE,
-  });
+  };
+  try {
+    videoEncoder.configure(encoderConfig);
+  } catch {
+    try {
+      videoEncoder.configure({
+        ...encoderConfig,
+        hardwareAcceleration: "no-preference",
+      });
+    } catch {
+      videoEncoder.configure({
+        ...encoderConfig,
+        latencyMode: "realtime",
+        hardwareAcceleration: "no-preference",
+      });
+    }
+  }
 
-  const videoProcessor = new MediaStreamTrackProcessor({ track: videoTrack });
+  const sourceTrack = tabComposite?.tabTrack ?? videoTrack!;
+  const videoProcessor = new MediaStreamTrackProcessor({ track: sourceTrack });
   const videoReader = videoProcessor.readable.getReader() as ReadableStreamDefaultReader<VideoFrame>;
+
+  let outputCanvas: HTMLCanvasElement | null = null;
+  let outputCtx: CanvasRenderingContext2D | null = null;
+  if (tabComposite) {
+    outputCanvas = document.createElement("canvas");
+    outputCanvas.width = outputWidth;
+    outputCanvas.height = outputHeight;
+    outputCtx = outputCanvas.getContext("2d", { alpha: false });
+    if (!outputCtx) {
+      throw new Error("recorder_no_canvas: 无法创建合成画布");
+    }
+  }
 
   let encoderClosed = false;
   let audioContext: AudioContext | null = null;
@@ -235,7 +306,7 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
     });
   };
 
-  const keyframeIntervalFrames = frameRate * 2;
+  const keyframeIntervalFrames = frameRate;
   const frameDurationUs = Math.round(1_000_000 / frameRate);
   let videoStopped = false;
   let frameCount = 0;
@@ -259,21 +330,35 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
         }
         const normalizedTs = Math.max(0, rawTs - recordingOriginTs);
         const duration = frame.duration ?? frameDurationUs;
-        const fixedFrame = new VideoFrame(frame, {
-          timestamp: normalizedTs,
-          duration,
-        });
-        frame.close();
+
+        let encodeFrame: VideoFrame;
+        if (tabComposite && outputCanvas && outputCtx) {
+          const rect = tabComposite.getCropRect();
+          const { x, y, w, h } = mapDomRectToFrameRect(
+            rect,
+            frame.displayWidth,
+            frame.displayHeight,
+          );
+          outputCtx.fillStyle = "#000";
+          outputCtx.fillRect(0, 0, outputWidth, outputHeight);
+          outputCtx.drawImage(frame, x, y, w, h, 0, 0, outputWidth, outputHeight);
+          frame.close();
+          encodeFrame = new VideoFrame(outputCanvas, { timestamp: normalizedTs, duration });
+        } else {
+          encodeFrame = new VideoFrame(frame, { timestamp: normalizedTs, duration });
+          frame.close();
+        }
+
         try {
-          videoEncoder.encode(fixedFrame, { keyFrame: isKeyFrame });
+          videoEncoder.encode(encodeFrame, { keyFrame: isKeyFrame });
         } catch (e) {
           if (e instanceof DOMException && e.name === "InvalidStateError") {
-            fixedFrame.close();
+            encodeFrame.close();
             break;
           }
           console.error("[recorder] encode failed:", e);
         } finally {
-          fixedFrame.close();
+          encodeFrame.close();
         }
         frameCount++;
       }
@@ -288,7 +373,7 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
     videoStopped = true;
     audioStopped = true;
 
-    try { videoTrack.stop(); } catch { /* ignore */ }
+    try { sourceTrack.stop(); } catch { /* ignore */ }
 
     try { await videoReader.cancel(); } catch { /* ignore */ }
     videoReader.releaseLock();
@@ -338,7 +423,7 @@ async function buildRecordingHandle(params: BuildRecordingParams): Promise<Recor
       muxer.finalize();
       const target = muxer.target as ArrayBufferTarget;
       const blob = new Blob([target.buffer], { type: "video/mp4" });
-      return { blob, durationMs: performance.now() - startedAt };
+      return { blob, durationMs: performance.now() - startedAt, width: outputWidth, height: outputHeight };
     },
     cancel: () => {
       void finalizeStop();
@@ -371,7 +456,12 @@ export async function startRecordingFromCanvas(
     videoTrack,
     width,
     height,
-    config,
+    config: {
+      ...config,
+      width,
+      height,
+      videoBitrate: config.videoBitrate ?? bitrateForExportSize(width, height),
+    },
     requestManualFrame: () => canvasCaptureTrack.requestFrame(),
     onCleanup: () => {
       try { videoTrack.stop(); } catch { /* ignore */ }
@@ -380,8 +470,7 @@ export async function startRecordingFromCanvas(
 }
 
 /**
- * HTML 动画：直接录制浏览器渲染的预览区域（getDisplayMedia + CropTarget）。
- * 与预览 iframe 像素级一致，不经过 html-to-image。
+ * HTML 动画：getDisplayMedia 采当前标签页，按预览区 DOM 裁切，固定输出项目画幅。
  */
 export async function startRecordingFromDisplayMedia(
   cropElement: HTMLElement,
@@ -389,6 +478,20 @@ export async function startRecordingFromDisplayMedia(
 ): Promise<RecordingHandle> {
   if (!navigator.mediaDevices?.getDisplayMedia) {
     throw new Error("当前浏览器不支持标签页录制，请使用 Chrome 或 Edge 导出 HTML 视频。");
+  }
+
+  const targetW = config.width ?? 1920;
+  const targetH = config.height ?? 1080;
+  const targetAspect = targetW / targetH;
+
+  const cropRect = cropElement.getBoundingClientRect();
+  const cropW = Math.max(1, cropRect.width);
+  const cropH = Math.max(1, cropRect.height);
+  const cropAspect = cropW / cropH;
+  if (Math.abs(cropAspect - targetAspect) > 0.05) {
+    throw new Error(
+      `预览区域比例 ${Math.round(cropW)}×${Math.round(cropH)} 与项目画幅 ${targetW}×${targetH} 不一致。`,
+    );
   }
 
   let stream: MediaStream;
@@ -410,34 +513,31 @@ export async function startRecordingFromDisplayMedia(
     throw e;
   }
 
-  const videoTrack = stream.getVideoTracks()[0];
-  if (!videoTrack) {
+  const tabTrack = stream.getVideoTracks()[0];
+  if (!tabTrack) {
     stream.getTracks().forEach((t) => t.stop());
     throw new Error("未获取到视频轨，请重新尝试导出。");
   }
 
-  const cropTargetFactory = (globalThis as typeof globalThis & { CropTarget?: CropTargetFactory })
-    .CropTarget;
-  if (cropTargetFactory && "cropTo" in videoTrack) {
+  if ("contentHint" in tabTrack) {
     try {
-      const cropTarget = await cropTargetFactory.fromElement(cropElement);
-      await (videoTrack as MediaStreamTrack & { cropTo: (t: unknown) => Promise<void> }).cropTo(
-        cropTarget,
-      );
-    } catch (e) {
-      console.warn("[recorder] CropTarget 裁剪失败，将使用你选择的共享区域:", e);
+      (tabTrack as MediaStreamTrack & { contentHint: string }).contentHint = "detail";
+    } catch {
+      /* ignore */
     }
   }
 
-  const settings = videoTrack.getSettings();
-  const width = settings.width ?? 1920;
-  const height = settings.height ?? 1080;
+  const videoBitrate =
+    config.videoBitrate ?? bitrateForExportSize(targetW, targetH);
 
   return buildRecordingHandle({
-    videoTrack,
-    width,
-    height,
-    config,
+    tabComposite: {
+      tabTrack,
+      getCropRect: () => cropElement.getBoundingClientRect(),
+    },
+    width: targetW,
+    height: targetH,
+    config: { ...config, width: targetW, height: targetH, videoBitrate },
     requestManualFrame: null,
     onCleanup: () => {
       stream.getTracks().forEach((t) => t.stop());
@@ -486,7 +586,6 @@ function ensureVideoMetaColorSpace(
 export function supportsDisplayMediaCrop(): boolean {
   return (
     typeof navigator !== "undefined" &&
-    Boolean(navigator.mediaDevices?.getDisplayMedia) &&
-    "CropTarget" in globalThis
+    Boolean(navigator.mediaDevices?.getDisplayMedia)
   );
 }

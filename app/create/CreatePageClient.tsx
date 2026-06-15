@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { AIChat, AIChatHeader } from "@/components/create/AIChat";
 import { Sidebar } from "@/components/create/Sidebar";
 import { StoryboardList } from "@/components/create/StoryboardList";
@@ -9,12 +10,19 @@ import { Toolbar } from "@/components/create/Toolbar";
 import { VideoPreview, type VideoPreviewHandle } from "@/components/create/VideoPreview";
 import { OutlineModal } from "@/components/create/OutlineModal";
 import { ExportModal } from "@/components/create/ExportModal";
+import { VideoSizePicker } from "@/components/create/VideoSizePicker";
 import {
   downloadBlob,
   startRecordingFromCanvas,
   startRecordingFromDisplayMedia,
   type RecordingHandle,
 } from "@/lib/recorder";
+import {
+  bitrateForVideoSize,
+  hasGeneratedSceneAssets,
+  resolveVideoSize,
+  type VideoSize,
+} from "@/lib/exportVideo";
 import { WORKSPACE_BOTTOM_DOCK_HEIGHT, WORKSPACE_HEADER_HEIGHT } from "@/lib/workspaceLayout";
 import { countPendingGenerateTasks } from "@/lib/pendingGenerateTasks";
 import {
@@ -24,6 +32,7 @@ import {
   loadStoryboardAction,
   regenerateSceneImageAction,
   renameProjectAction,
+  updateProjectVideoSizeAction,
 } from "@/app/actions";
 import type { PersistedChatMessage } from "@/lib/chatTypes";
 import type { VideoOutline } from "@/lib/outlineTypes";
@@ -99,12 +108,19 @@ export default function CreatePageClient({
   // VideoPreview 通过 ref 暴露录制 canvas 和当前正在播放的 <audio>
   const videoPreviewRef = useRef<VideoPreviewHandle | null>(null);
   const bulkAbortRef = useRef<boolean>(false);
+  /** 区分「首次进入页面」与「切换项目」，避免清空服务端预载的大纲导致预览闪空白 */
+  const prevActiveProjectIdRef = useRef<string | null>(null);
 
   const project = useMemo(
     () =>
       projects.find((p) => p.uuid === activeProjectId) ?? projects[0] ?? null,
     [activeProjectId, projects],
   );
+  const videoSize = useMemo(
+    () => resolveVideoSize(outline, project),
+    [outline, project],
+  );
+  const videoSizeLocked = hasGeneratedSceneAssets(outline);
   const scenes = outline?.scenes ?? [];
   const activeScene = useMemo(() => {
     if (!activeSceneId) return null;
@@ -114,12 +130,26 @@ export default function CreatePageClient({
     return scenes.find((s) => s.index === idx) ?? null;
   }, [activeSceneId, scenes]);
 
-  // 切到新项目时：清大纲、清场景、拉聊天历史和故事板
+  // 切到新项目时：拉聊天历史和故事板；仅在真正切换项目时清空大纲
   useEffect(() => {
-    setOutline(null);
-    setActiveSceneId(null);
-    setChatHistory([]);
-    if (!activeProjectId) return;
+    const switchedProject =
+      prevActiveProjectIdRef.current !== null &&
+      prevActiveProjectIdRef.current !== activeProjectId;
+    prevActiveProjectIdRef.current = activeProjectId;
+
+    if (!activeProjectId) {
+      setOutline(null);
+      setActiveSceneId(null);
+      setChatHistory([]);
+      return;
+    }
+
+    if (switchedProject) {
+      setOutline(null);
+      setActiveSceneId(null);
+      setChatHistory([]);
+    }
+
     let cancelled = false;
     setChatLoading(true);
 
@@ -426,18 +456,29 @@ export default function CreatePageClient({
    */
   const handleStartExport = useCallback(async (): Promise<void> => {
     setExportError(null);
-    setExportModalOpen(false);
-    setRecordingCaptureReady(false);
-    setRecordingMode(true);
+
+    flushSync(() => {
+      setExportModalOpen(false);
+      setRecordingCaptureReady(false);
+      setRecordingMode(true);
+    });
 
     const isHtmlProject = projectType === "html";
+    const recorderConfig = {
+      frameRate: 30,
+      width: videoSize.width,
+      height: videoSize.height,
+      videoBitrate: bitrateForVideoSize(videoSize.width, videoSize.height),
+      withAudio: true,
+    };
 
     try {
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => resolve());
-        });
-      });
+      await waitForCaptureRegion(
+        () => videoPreviewRef.current?.getCaptureRegion() ?? null,
+        isHtmlProject ? videoSize.width : 0,
+        isHtmlProject ? videoSize.height : 0,
+        5000,
+      );
 
       let handle: RecordingHandle;
 
@@ -446,22 +487,14 @@ export default function CreatePageClient({
         if (!region) {
           throw new Error("预览区域尚未就绪，请稍后再试。");
         }
-        handle = await startRecordingFromDisplayMedia(region, {
-          frameRate: 30,
-          videoBitrate: 5_000_000,
-          withAudio: true,
-        });
+        handle = await startRecordingFromDisplayMedia(region, recorderConfig);
         recordingFrameBridgeRef.current = null;
       } else {
         const canvas = videoPreviewRef.current?.getRecordingCanvas();
         if (!canvas) {
           throw new Error("录制画布尚未就绪，请稍后再试。");
         }
-        handle = await startRecordingFromCanvas(canvas, {
-          frameRate: 30,
-          videoBitrate: 5_000_000,
-          withAudio: true,
-        });
+        handle = await startRecordingFromCanvas(canvas, recorderConfig);
         recordingFrameBridgeRef.current = () => handle.notifyFrameDrawn();
       }
 
@@ -481,7 +514,25 @@ export default function CreatePageClient({
       setRecordingMode(false);
       throw err;
     }
-  }, [projectType]);
+  }, [projectType, videoSize]);
+
+  const handleVideoSizeChange = useCallback(
+    async (next: VideoSize) => {
+      if (!activeProjectId || videoSizeLocked) return;
+      const res = await updateProjectVideoSizeAction(activeProjectId, next);
+      if (!res.ok) {
+        setExportError(res.error);
+        return;
+      }
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.uuid === activeProjectId ? { ...p, videoSize: res.videoSize } : p,
+        ),
+      );
+      setOutline((prev) => (prev ? { ...prev, videoSize: res.videoSize } : prev));
+    },
+    [activeProjectId, videoSizeLocked],
+  );
 
   /**
    * audio 桥接：父级向 VideoPreview 注入回调，VideoPreview 每次切 audio 时
@@ -527,13 +578,13 @@ export default function CreatePageClient({
       return;
     }
     try {
-      const { blob } = await handle.stop();
+      const { blob, width, height } = await handle.stop();
       const projectTitle = project?.title?.replace(/[^\w一-龥-]+/g, "_") || "video";
       const stamp = new Date()
         .toISOString()
         .replace(/[-:T]/g, "")
         .slice(0, 14);
-      downloadBlob(blob, `${projectTitle}_${stamp}.mp4`);
+      downloadBlob(blob, `${projectTitle}_${width}x${height}_${stamp}.mp4`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[handleRecordingComplete] failed:", msg);
@@ -593,6 +644,9 @@ export default function CreatePageClient({
         onRecordingCancel={handleRecordingCancel}
         videoPreviewRef={videoPreviewRef}
         onAudioElementChange={handleAudioElementChange}
+        videoSize={videoSize}
+        videoSizeLocked={videoSizeLocked}
+        onVideoSizeChange={handleVideoSizeChange}
       />
 
       {outlineModal && (
@@ -613,6 +667,7 @@ export default function CreatePageClient({
         onStart={handleStartExport}
         sceneCount={outline?.scenes.length ?? 0}
         projectType={projectType}
+        videoSize={videoSize}
       />
 
       {exportError && (
@@ -653,6 +708,7 @@ export default function CreatePageClient({
               onRecordingCancel={handleRecordingCancel}
               onAudioElementChange={handleAudioElementChange}
               fillContainer
+              videoSize={videoSize}
             />
           </div>
           {projectType === "html" && (
@@ -720,6 +776,9 @@ function SplitWorkspace(props: {
   videoPreviewRef: React.MutableRefObject<VideoPreviewHandle | null>;
   /** VideoPreview 内部 audio 切换时通知父级 */
   onAudioElementChange: (audio: HTMLAudioElement | null) => void;
+  videoSize: VideoSize;
+  videoSizeLocked: boolean;
+  onVideoSizeChange: (size: VideoSize) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [chatRatio, setChatRatio] = useState<number>(DEFAULT_CHAT_RATIO);
@@ -826,6 +885,7 @@ function SplitWorkspace(props: {
             onToggleSubtitle={props.onToggleSubtitle}
             onExportVideo={props.onOpenExport}
             exportDisabled={props.exportDisabled}
+            videoSize={props.videoSize}
           />
         </div>
         <div
@@ -849,6 +909,19 @@ function SplitWorkspace(props: {
         <div className="flex min-h-0 flex-1 flex-col px-6">
           {props.hasProject ? (
             <div className="mx-auto flex h-full min-h-0 w-full max-w-5xl flex-col gap-3">
+              {!props.videoSizeLocked && (
+                <div className="shrink-0 rounded-xl border border-ink-200 bg-white px-4 py-3">
+                  <p className="mb-2 text-xs font-semibold text-ink-800">视频画幅</p>
+                  <VideoSizePicker
+                    compact
+                    value={props.videoSize}
+                    onChange={props.onVideoSizeChange}
+                  />
+                  <p className="mt-2 text-[11px] text-ink-500">
+                    请在生成分镜前选定画幅；生成后将锁定，避免导出变形。
+                  </p>
+                </div>
+              )}
               {!props.recordingMode ? (
                 <div className="min-h-0 flex-1">
                   <VideoPreview
@@ -865,6 +938,7 @@ function SplitWorkspace(props: {
                     onRecordingCancel={props.onRecordingCancel}
                     onAudioElementChange={props.onAudioElementChange}
                     fillContainer
+                    videoSize={props.videoSize}
                   />
                 </div>
               ) : (
@@ -975,4 +1049,40 @@ function formatCreatedLabel(iso: string): string {
   const d = new Date(iso);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 等待录制预览区挂载；HTML 模式要求区域比例与项目画幅一致 */
+async function waitForCaptureRegion(
+  getRegion: () => HTMLElement | null,
+  expectedWidth: number,
+  expectedHeight: number,
+  maxMs: number,
+): Promise<void> {
+  const start = performance.now();
+  const needAspect = expectedWidth > 0 && expectedHeight > 0;
+  const expectedAspect = expectedWidth / expectedHeight;
+  const aspectTol = 0.05;
+  while (performance.now() - start < maxMs) {
+    const el = getRegion();
+    if (el) {
+      const { width, height } = el.getBoundingClientRect();
+      if (needAspect) {
+        if (width >= 320 && height >= 180) {
+          const aspect = width / height;
+          if (Math.abs(aspect - expectedAspect) <= aspectTol) {
+            return;
+          }
+        }
+      } else if (width >= 320 && height >= 180) {
+        return;
+      }
+    }
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  }
+  if (needAspect) {
+    throw new Error(
+      `预览区域尚未就绪（需要 ${expectedWidth}×${expectedHeight} 比例），请稍后再试。`,
+    );
+  }
+  throw new Error("预览区域尚未就绪，请稍后再试。");
 }

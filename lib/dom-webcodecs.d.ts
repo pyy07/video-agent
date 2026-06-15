@@ -34,6 +34,8 @@ declare global {
 
   interface VideoEncoderConfig {
     colorSpace?: VideoColorSpace;
+    bitrateMode?: "constant" | "variable";
+    hardwareAcceleration?: "no-preference" | "prefer-hardware" | "prefer-software";
   }
 
   // eslint-disable-next-line no-var

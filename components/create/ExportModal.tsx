@@ -3,6 +3,7 @@
 import clsx from "clsx";
 import { CircleAlert, Film, Loader2, MonitorUp, ShieldCheck, Sparkles, X } from "lucide-react";
 import { useEffect, useState } from "react";
+import type { VideoSize } from "@/lib/exportVideo";
 import type { ProjectType } from "@/lib/projectTypes";
 import { PROJECT_TYPE_LABEL } from "@/lib/projectTypes";
 
@@ -12,6 +13,8 @@ type ExportModalProps = {
   onStart: () => Promise<void>;
   sceneCount: number;
   projectType: ProjectType;
+  /** 项目创建/生成时设定的画幅，导出沿用此尺寸 */
+  videoSize: VideoSize;
 };
 
 type Phase = "ready" | "starting" | "error";
@@ -27,6 +30,7 @@ export function ExportModal({
   onStart,
   sceneCount,
   projectType,
+  videoSize,
 }: ExportModalProps) {
   const [phase, setPhase] = useState<Phase>("ready");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -97,6 +101,13 @@ export function ExportModal({
         </header>
 
         <div className="space-y-4 px-5 py-4">
+          <div className="rounded-lg border border-ink-200 bg-ink-50/60 px-3 py-2.5 text-[12px] text-ink-700">
+            输出画幅：<span className="font-medium text-ink-900">{videoSize.label}</span>
+            <p className="mt-1 text-[11px] leading-relaxed text-ink-500">
+              画幅在项目创建时设定，并与 AI 生成分镜保持一致；导出不再切换比例，避免画面变形。
+            </p>
+          </div>
+
           {isHtml ? (
             <>
               <Step

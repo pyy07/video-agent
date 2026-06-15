@@ -7,6 +7,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -23,6 +24,13 @@ import {
 } from "@/lib/audioSlices";
 import type { OutlineScene } from "@/lib/outlineTypes";
 import type { ProjectType } from "@/lib/projectTypes";
+import {
+  DEFAULT_VIDEO_SIZE,
+  isPortraitVideoSize,
+  logicalCanvasSize,
+  type VideoSize,
+} from "@/lib/exportVideo";
+import clsx from "clsx";
 
 type VideoPreviewProps = {
   scene: OutlineScene | null;
@@ -58,6 +66,8 @@ type VideoPreviewProps = {
    *  - 控件栏保持原本大小
    */
   fillContainer?: boolean;
+  /** 项目画幅（创建/生成时设定，预览与导出一致） */
+  videoSize?: VideoSize;
 };
 
 /** 父级通过 ref 拿到录制区域 / canvas / 当前 audio */
@@ -78,8 +88,12 @@ const RECORDING_FRAME_MS = 1000 / RECORDING_FPS;
 /** HTML 分镜 iframe 分批预载间隔（毫秒） */
 const HTML_IFRAME_PRELOAD_STAGGER_MS = 200;
 
-function sceneHtmlUrl(projectId: string, sceneIndex: number): string {
-  return `/api/project-scenes/${projectId}/${sceneIndex}.html`;
+/** embed 注入逻辑变更时递增，避免浏览器 304 复用旧 HTML */
+const SCENE_EMBED_REV = 6;
+
+function sceneHtmlUrl(projectId: string, sceneIndex: number, videoSize: VideoSize): string {
+  const logical = logicalCanvasSize(videoSize);
+  return `/api/project-scenes/${projectId}/${sceneIndex}.html?embed=1&lw=${logical.width}&lh=${logical.height}&ev=${SCENE_EMBED_REV}`;
 }
 
 export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
@@ -98,10 +112,16 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       onRecordingCancel,
       onAudioElementChange,
       fillContainer = false,
+      videoSize,
     },
     ref,
   ) {
     const isHtmlMode = projectType === "html";
+    const resolvedVideoSize = videoSize ?? DEFAULT_VIDEO_SIZE;
+    const exportWidth = resolvedVideoSize.width;
+    const exportHeight = resolvedVideoSize.height;
+    const exportPortrait = isPortraitVideoSize(resolvedVideoSize);
+    const exportAspectRatio = `${exportWidth} / ${exportHeight}`;
     const [isPlaying, setIsPlaying] = useState(false);
     const [currentIndex, setCurrentIndex] = useState(0);
     const [currentTime, setCurrentTime] = useState(0);
@@ -183,8 +203,28 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     /** 驱动字幕随 audio.timeupdate 刷新 */
     const [subtitlePulse, setSubtitlePulse] = useState(0);
     const lastProgressTimeRef = useRef(0);
-    /** HTML 模式：getDisplayMedia 裁剪此区域 */
+    /** HTML 模式：导出时从此 DOM 区域裁切画面 */
     const captureRegionRef = useRef<HTMLDivElement | null>(null);
+    /** 录制时把 1920×1080 预览区缩小以适应窗口，保证整页可见 */
+    const [recordFitScale, setRecordFitScale] = useState(1);
+
+    useLayoutEffect(() => {
+      if (!recordingMode || !isHtmlMode || !fillContainer) {
+        setRecordFitScale(1);
+        return;
+      }
+      const footerH = 44;
+      const update = () => {
+        const mw = window.innerWidth;
+        const mh = Math.max(200, window.innerHeight - footerH);
+        setRecordFitScale(
+          Math.min(1, mw / exportWidth, mh / exportHeight),
+        );
+      };
+      update();
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }, [recordingMode, isHtmlMode, fillContainer, exportWidth, exportHeight]);
 
     useImperativeHandle(ref, () => ({
       getRecordingCanvas: () => recordingCanvasRef.current,
@@ -941,7 +981,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
       if (!ctx) return;
       ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "low";
+      ctx.imageSmoothingQuality = "high";
 
       let stopped = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1005,14 +1045,23 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         }
       >
         {isHtmlRecording ? (
-          <div className="flex h-full min-h-0 w-full items-center justify-center bg-black">
+          <div className="flex h-full min-h-0 w-full items-center justify-center overflow-hidden bg-black">
             <div
               ref={captureRegionRef}
-              className="relative aspect-video h-full w-auto max-w-full overflow-hidden bg-black"
+              data-recording-capture="1"
+              className="relative shrink-0 overflow-hidden bg-black"
+              style={{
+                width: exportWidth,
+                height: exportHeight,
+                transform: `scale(${recordFitScale}) translateZ(0)`,
+                transformOrigin: "center center",
+                backfaceVisibility: "hidden",
+              }}
             >
               <HtmlSceneLayers
                 allScenes={allScenes}
                 projectId={projectId}
+                videoSize={resolvedVideoSize}
                 currentIndex={currentIndex}
                 prevScene={prevScene}
                 currentOpacity={currentOpacity}
@@ -1038,28 +1087,69 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
           </div>
         ) : (
         <>
+        {fillContainer && isHtmlMode ? (
+          <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-xl bg-black">
+            <div
+              ref={captureRegionRef}
+              className={clsx(
+                "relative overflow-hidden",
+                exportPortrait ? "h-full w-auto max-w-full" : "h-auto w-full max-h-full",
+              )}
+              style={{ aspectRatio: exportAspectRatio }}
+            >
+              <HtmlSceneLayers
+                allScenes={allScenes}
+                projectId={projectId}
+                videoSize={resolvedVideoSize}
+                currentIndex={currentIndex}
+                prevScene={prevScene}
+                currentOpacity={currentOpacity}
+                prevOpacity={prevOpacity}
+                sceneTimelineReady={sceneTimelineReady}
+              />
+              {showSubtitle && subtitleText && (
+                <div className="absolute inset-x-0 bottom-8 z-10 flex justify-center px-6 pointer-events-none">
+                  <span
+                    key={activeClauseIdx}
+                    className="max-w-[90%] rounded-md px-5 py-2 text-center text-lg font-semibold leading-snug text-white"
+                    style={{
+                      textShadow:
+                        "0 2px 6px rgba(0,0,0,0.85), 0 0 2px rgba(0,0,0,0.9), 0 1px 0 rgba(0,0,0,0.9), 0 -1px 0 rgba(0,0,0,0.9), 1px 0 0 rgba(0,0,0,0.9), -1px 0 0 rgba(0,0,0,0.9)",
+                      letterSpacing: "0.02em",
+                    }}
+                  >
+                    {subtitleText}
+                  </span>
+                </div>
+              )}
+              <div className="absolute left-4 top-4 flex items-center gap-1.5">
+                <span className="rounded-md bg-black/40 px-2 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
+                  {currentScene?.title ?? ""}
+                </span>
+                <span className="rounded-md bg-black/40 px-1.5 py-1 text-[10px] text-white/80 backdrop-blur-sm">
+                  {currentIndex + 1}/{allScenes.length}
+                </span>
+              </div>
+            </div>
+          </div>
+        ) : (
         <div
           ref={captureRegionRef}
           className={
             fillContainer
-              ? recordingMode && isHtmlMode
-                ? "relative mx-auto w-full max-h-full overflow-hidden rounded-xl shadow-soft"
-                : recordingMode && !isHtmlMode
+              ? recordingMode && !isHtmlMode
                   ? "relative mx-auto flex aspect-video w-full max-h-full items-center justify-center overflow-hidden rounded-xl bg-black shadow-soft"
                   : "relative w-full flex-1 overflow-hidden rounded-xl shadow-soft"
+              : exportPortrait
+                ? "relative mx-auto aspect-[9/16] h-[420px] w-auto max-w-full overflow-hidden rounded-xl shadow-soft"
               : "relative h-[420px] w-full overflow-hidden rounded-xl shadow-soft"
-          }
-          style={
-            recordingMode && isHtmlMode && fillContainer
-              ? { aspectRatio: "16 / 9" }
-              : undefined
           }
         >
           {recordingMode && !isHtmlMode ? (
             <canvas
               ref={recordingCanvasRef}
-              width={RECORDING_W}
-              height={RECORDING_H}
+              width={exportWidth}
+              height={exportHeight}
               className="h-full w-full"
               style={{ objectFit: "contain" }}
             />
@@ -1067,6 +1157,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             <HtmlSceneLayers
               allScenes={allScenes}
               projectId={projectId}
+              videoSize={resolvedVideoSize}
               currentIndex={currentIndex}
               prevScene={prevScene}
               currentOpacity={currentOpacity}
@@ -1079,6 +1170,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                 <SceneLayer
                   scene={currentScene}
                   projectId={projectId}
+                  videoSize={resolvedVideoSize}
                   opacity={currentOpacity}
                   fade={Boolean(prevScene)}
                   isHtmlMode={false}
@@ -1089,6 +1181,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
                   key={`prev-${prevScene.index}`}
                   scene={prevScene}
                   projectId={projectId}
+                  videoSize={resolvedVideoSize}
                   opacity={prevOpacity}
                   fade
                   isHtmlMode={false}
@@ -1122,6 +1215,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
             </div>
           )}
         </div>
+        )}
         {recordingMode && !isHtmlMode && (
           <div className="pointer-events-none absolute right-4 top-4 z-20 flex items-center gap-1.5 rounded-md bg-red-500/95 px-2 py-1 text-[11px] font-semibold text-white shadow-md backdrop-blur-sm">
             <span className="relative grid h-2 w-2 place-items-center">
@@ -1498,6 +1592,7 @@ function hexToRgb(hex: string): [number, number, number] | null {
 function HtmlSceneLayers({
   allScenes,
   projectId,
+  videoSize,
   currentIndex,
   prevScene,
   currentOpacity,
@@ -1506,6 +1601,7 @@ function HtmlSceneLayers({
 }: {
   allScenes: OutlineScene[];
   projectId: string | null;
+  videoSize: VideoSize;
   currentIndex: number;
   prevScene: OutlineScene | null;
   currentOpacity: number;
@@ -1525,9 +1621,9 @@ function HtmlSceneLayers({
     if (!projectId || !sceneTimelineReady || prefetchStartedRef.current) return;
     prefetchStartedRef.current = true;
     for (const idx of htmlSceneIndices) {
-      void fetch(sceneHtmlUrl(projectId, idx)).catch(() => undefined);
+      void fetch(sceneHtmlUrl(projectId, idx, videoSize)).catch(() => undefined);
     }
-  }, [projectId, sceneTimelineReady, htmlSceneIndices]);
+  }, [projectId, sceneTimelineReady, htmlSceneIndices, videoSize]);
 
   // 2) 时间轴就绪后分批挂载 iframe（首镜优先，其余每 200ms 一个，只执行一次）
   useEffect(() => {
@@ -1605,7 +1701,7 @@ function HtmlSceneLayers({
         }
 
         const zIndex = isCurrent ? 2 : isPrev ? 1 : 0;
-        const url = sceneHtmlUrl(projectId, sceneIndex);
+        const url = sceneHtmlUrl(projectId, sceneIndex, videoSize);
 
         return (
           <div
@@ -1638,10 +1734,11 @@ function HtmlSceneLayers({
 }
 
 function SceneLayer({
-  scene, projectId, opacity, fade, isHtmlMode,
+  scene, projectId, videoSize, opacity, fade, isHtmlMode,
 }: {
   scene: OutlineScene;
   projectId: string | null;
+  videoSize: VideoSize;
   opacity: number;
   fade: boolean;
   isHtmlMode: boolean;
@@ -1652,7 +1749,7 @@ function SceneLayer({
     ? `/api/project-images/${projectId}/${scene.index}.png`
     : null;
   const htmlUrl = hasHtml && projectId
-    ? `/api/project-scenes/${projectId}/${scene.index}.html`
+    ? sceneHtmlUrl(projectId, scene.index, videoSize)
     : null;
   const cover = pickSceneCover(scene.index);
   const opacityTransition = fade ? `opacity ${FADE_DURATION_MS}ms ease-in-out` : undefined;

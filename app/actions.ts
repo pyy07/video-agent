@@ -20,6 +20,7 @@ import {
   saveStoryboard,
   isDefaultProjectTitle,
   updateAllSceneAudioPaths,
+  updateProjectVideoSize,
   updateSceneHtmlPath,
   updateSceneImagePath,
   updateSceneNarration,
@@ -31,6 +32,12 @@ import {
   type ProjectType,
   type VideoOutline,
 } from "@/lib/projects";
+import {
+  hasGeneratedSceneAssets,
+  normalizeVideoSize,
+  resolveVideoSize,
+  type VideoSize,
+} from "@/lib/exportVideo";
 
 export type CreateProjectResult =
   | { ok: true; uuid: string }
@@ -38,12 +45,14 @@ export type CreateProjectResult =
 
 export async function createProjectAction(
   type: ProjectType,
+  videoSizeInput?: VideoSize,
 ): Promise<CreateProjectResult> {
   if (type !== "image" && type !== "html") {
     return { ok: false, error: "未知的创作模式" };
   }
+  const videoSize = normalizeVideoSize(videoSizeInput);
   try {
-    const project = await createProject({ type });
+    const project = await createProject({ type, videoSize: videoSize ?? undefined });
     revalidatePath("/create");
     return { ok: true, uuid: project.uuid };
   } catch (err) {
@@ -325,6 +334,48 @@ export async function renameProjectAction(
   }
 }
 
+export type UpdateProjectVideoSizeResult =
+  | { ok: true; videoSize: VideoSize }
+  | { ok: false; error: string };
+
+/** 更新项目画幅（已有生成资产时拒绝，避免导出变形） */
+export async function updateProjectVideoSizeAction(
+  projectId: string,
+  videoSizeInput: VideoSize,
+): Promise<UpdateProjectVideoSizeResult> {
+  if (!UUID_RE.test(projectId)) {
+    return { ok: false, error: "无效的项目 ID" };
+  }
+  const videoSize = normalizeVideoSize(videoSizeInput);
+  if (!videoSize) {
+    return { ok: false, error: "无效的画幅" };
+  }
+
+  const outline = await loadStoryboard(projectId);
+  if (hasGeneratedSceneAssets(outline)) {
+    return {
+      ok: false,
+      error: "已生成分镜画面后不能修改画幅，请新建项目并重新生成。",
+    };
+  }
+
+  try {
+    const res = await updateProjectVideoSize(projectId, videoSize);
+    if (!res.ok) return res;
+
+    if (outline) {
+      await saveStoryboard(projectId, { ...outline, videoSize: res.videoSize });
+    }
+
+    revalidatePath("/create");
+    return res;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[updateProjectVideoSizeAction] failed for ${projectId}:`, msg);
+    return { ok: false, error: `更新画幅失败：${msg}` };
+  }
+}
+
 export type DeleteProjectResult =
   | { ok: true }
   | { ok: false; error: string };
@@ -433,6 +484,7 @@ export async function generateImagesAction(
           projectId,
           sceneIndex: scene.index,
           prompt: scene.prompt,
+          videoSize: resolveVideoSize(outline),
         });
 
         // 更新 storyboard 中该分镜的图片路径
@@ -507,6 +559,7 @@ export async function generateSceneImageAction(
       projectId,
       sceneIndex,
       prompt: scene.prompt,
+      videoSize: resolveVideoSize(outline),
     });
     await updateSceneImagePath(projectId, sceneIndex, result.relativePath);
 
@@ -551,6 +604,7 @@ export async function regenerateSceneImageAction(
       projectId,
       sceneIndex,
       prompt: scene.prompt,
+      videoSize: resolveVideoSize(outline),
     });
     await updateSceneImagePath(projectId, sceneIndex, result.relativePath);
     const fresh = await loadStoryboard(projectId);
@@ -912,6 +966,7 @@ export async function generateSceneHtmlAction(
       scene,
       previousHtml,
       previousIndex,
+      videoSize: resolveVideoSize(outline),
     });
     await updateSceneHtmlPath(projectId, sceneIndex, result.relativePath);
 
@@ -1042,6 +1097,7 @@ export async function regenerateSceneHtmlAction(
       scene,
       previousHtml,
       previousIndex,
+      videoSize: resolveVideoSize(outline),
     });
     await updateSceneHtmlPath(projectId, sceneIndex, result.relativePath);
 

@@ -1,6 +1,7 @@
 import "server-only";
 import { generateOutline } from "./outline";
-import { saveStoryboard } from "./projects";
+import { getProject, saveStoryboard } from "./projects";
+import { resolveVideoSize } from "./exportVideo";
 import type {
   IntentAction,
   IntentHandlerContext,
@@ -22,11 +23,14 @@ export const INTENT_HANDLERS: Record<
   (ctx: IntentHandlerContext) => Promise<IntentHandlerResult>
 > = {
   generate_video_outline: async (ctx) => {
+    const project = await getProject(ctx.projectId);
+    const videoSize = resolveVideoSize(null, project);
     const outline = await generateOutline({
       projectId: ctx.projectId,
       mode: ctx.mode,
       prompt: ctx.prompt,
       history: ctx.history,
+      videoSize,
     });
     await saveStoryboard(ctx.projectId, outline);
     const totalChars = outline.script.length;

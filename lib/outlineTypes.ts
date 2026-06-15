@@ -1,6 +1,7 @@
 // 视频大纲相关类型 —— client-safe。
 // 此文件严禁 import 任何 Node 依赖。
 
+import type { VideoSize } from "./exportVideo";
 import type { ProjectType } from "./projectTypes";
 
 export interface OutlineScene {
@@ -37,6 +38,10 @@ export interface VideoOutline {
   mode: ProjectType;
   /** 完整逐字稿（与 scenes 拆分的总集） */
   script: string;
+  /**
+   * 视频画幅（生成大纲时写入，HTML/图片生成与导出均以此为准）
+   */
+  videoSize?: VideoSize;
   /**
    * 全局画面风格（仅 image 模式）。
    * 归一化后的英文 prose；各分镜 prompt 由 buildSceneImagePrompt 与其拼接，勿重复堆叠。

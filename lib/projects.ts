@@ -5,6 +5,7 @@ import path from "node:path";
 import type { PersistedChatMessage } from "./chatTypes";
 import { INTENT_ACTIONS } from "./intents";
 import type { VideoOutline, OutlineScene } from "./outlineTypes";
+import { normalizeVideoSize, DEFAULT_VIDEO_SIZE, type VideoSize } from "./exportVideo";
 import {
   PROJECT_TYPE_LABEL,
   type ProjectDetail,
@@ -65,6 +66,7 @@ interface MetaFile {
   title: string;
   type: ProjectType;
   createdAt: string;
+  videoSize?: VideoSize;
 }
 
 export function defaultTitleFor(type: ProjectType): string {
@@ -115,6 +117,7 @@ async function readMeta(dir: string): Promise<MetaFile | null> {
         title: parsed.title,
         type: parsed.type,
         createdAt: parsed.createdAt,
+        videoSize: normalizeVideoSize(parsed.videoSize) ?? undefined,
       };
     }
   } catch {
@@ -129,12 +132,14 @@ function metaToSummary(m: MetaFile): ProjectSummary {
     title: m.title,
     type: m.type,
     createdAt: m.createdAt,
+    videoSize: m.videoSize,
   };
 }
 
 export async function createProject(opts: {
   type: ProjectType;
   title?: string;
+  videoSize?: VideoSize;
 }): Promise<ProjectSummary> {
   if (opts.type !== "image" && opts.type !== "html") {
     throw new Error("无效的项目类型");
@@ -147,11 +152,14 @@ export async function createProject(opts: {
   const dir = path.join(root, uuid);
   await mkdir(dir, { recursive: false });
 
+  const videoSize = normalizeVideoSize(opts.videoSize) ?? DEFAULT_VIDEO_SIZE;
+
   const meta: MetaFile = {
     uuid,
     title: (opts.title ?? defaultTitleFor(opts.type)).slice(0, 255),
     type: opts.type,
     createdAt: new Date().toISOString(),
+    videoSize,
   };
 
   await Promise.all([
@@ -231,6 +239,24 @@ export async function renameProject(
   meta.title = next;
   await writeAtomic(path.join(dir, META_FILE), JSON.stringify(meta, null, 2) + "\n");
   return { ok: true, title: next };
+}
+
+/** 更新项目画幅（仅 meta.json；需在外层校验是否已有生成资产） */
+export async function updateProjectVideoSize(
+  uuid: string,
+  videoSize: VideoSize,
+): Promise<{ ok: true; videoSize: VideoSize } | { ok: false; error: string }> {
+  if (!UUID_RE.test(uuid)) return { ok: false, error: "无效的项目 ID" };
+  const normalized = normalizeVideoSize(videoSize);
+  if (!normalized) return { ok: false, error: "无效的画幅" };
+
+  const dir = projectDir(uuid);
+  const meta = await readMeta(dir);
+  if (!meta) return { ok: false, error: "项目不存在" };
+
+  meta.videoSize = normalized;
+  await writeAtomic(path.join(dir, META_FILE), JSON.stringify(meta, null, 2) + "\n");
+  return { ok: true, videoSize: normalized };
 }
 
 /**

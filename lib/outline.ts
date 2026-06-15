@@ -8,6 +8,8 @@ import {
 } from "./imagePrompt";
 import type { VideoOutline, OutlineScene } from "./outlineTypes";
 import type { ProjectType } from "./projectTypes";
+import type { VideoSize } from "./exportVideo";
+import { videoSizeSpecForLlm } from "./exportVideo";
 
 /**
  * 视频大纲生成器。
@@ -37,6 +39,8 @@ export interface GenerateOutlineInput {
   prompt: string;
   /** 最近对话历史（已截断到 20 轮 / 16k 字符） */
   history: ReadonlyArray<{ role: "user" | "assistant"; content: string }>;
+  /** 视频画幅（写入大纲并影响 prompt 排版描述） */
+  videoSize: VideoSize;
 }
 
 export async function generateOutline(
@@ -45,11 +49,15 @@ export async function generateOutline(
   // image模式下：先为整个视频生成一个统一的画面风格
   let globalStylePrompt: string | undefined;
   if (input.mode === "image") {
-    globalStylePrompt = await generateGlobalStylePrompt(input.prompt, input.history);
+    globalStylePrompt = await generateGlobalStylePrompt(
+      input.prompt,
+      input.history,
+      input.videoSize,
+    );
     globalStylePrompt = normalizeGlobalStylePrompt(globalStylePrompt);
   }
 
-  const system = buildOutlineSystemPrompt(input.mode, globalStylePrompt);
+  const system = buildOutlineSystemPrompt(input.mode, input.videoSize, globalStylePrompt);
   const messages = input.history.map((m) => ({
     role: m.role,
     content: m.content,
@@ -57,7 +65,7 @@ export async function generateOutline(
   messages.push({ role: "user", content: input.prompt });
 
   const raw = await callLLM({ system, messages });
-  return parseOutlineResponse(raw, input.mode, globalStylePrompt);
+  return parseOutlineResponse(raw, input.mode, input.videoSize, globalStylePrompt);
 }
 
 /**
@@ -68,8 +76,16 @@ export async function generateOutline(
 async function generateGlobalStylePrompt(
   prompt: string,
   history: ReadonlyArray<{ role: "user" | "assistant"; content: string }>,
+  videoSize: VideoSize,
 ): Promise<string> {
+  const aspectNote = videoSize.height > videoSize.width
+    ? "composition：竖屏 9:16，主体居中，上下留白，适合手机观看"
+    : "composition：16:9 宽屏，居中主体、留白字幕区等";
+
   const styleSystem = `你是 AI 视频创作助手的大纲生成器，专注「图片轮播 + 旁白讲解」类短视频（人物传记、历史事件、知识科普、文化解读等）。
+
+# 画幅
+${videoSizeSpecForLlm(videoSize)}
 
 # 你的任务
 根据用户的创作想法，为整组视频输出**一套统一的全局画面风格**（JSON 对象）。后续每个分镜只会单独描述「本镜主体画面」，不会再重复写风格，因此请把风格信息写全。
@@ -78,7 +94,7 @@ async function generateGlobalStylePrompt(
 - visualMotif：贯穿全片的视觉母题（如 historical portrait series / documentary photo essay / illustrated timeline）
 - overallStyle：整体画风（写实摄影 / 纪实插画 / 油画质感 / 3D 等）
 - lightingColor：光照与主色调
-- composition：构图习惯（16:9 宽屏、居中主体、留白字幕区等）
+- composition：构图习惯（${aspectNote}）
 - mood：氛围关键词
 
 # 题材提示
@@ -108,7 +124,15 @@ async function generateGlobalStylePrompt(
   return normalizeGlobalStylePrompt(raw);
 }
 
-function buildOutlineSystemPrompt(mode: ProjectType, globalStylePrompt?: string): string {
+function buildOutlineSystemPrompt(
+  mode: ProjectType,
+  videoSize: VideoSize,
+  globalStylePrompt?: string,
+): string {
+  const sizeBlock = `# 视频画幅（硬性）
+${videoSizeSpecForLlm(videoSize)}
+所有分镜的 \`prompt\` 必须按此画幅设计版式与元素排布；竖屏禁止宽屏横向多栏拓扑，横屏禁止竖向长条堆叠占满全屏。`;
+
   const modeBlock =
     mode === "html"
       ? `# 当前模式：HTML 动画视频（适合数学定理、几何推导、公式变换、流程演示等）
@@ -118,7 +142,7 @@ function buildOutlineSystemPrompt(mode: ProjectType, globalStylePrompt?: string)
 - **元素动作**：每个元素如何运动（位移 / 旋转 / 缩放 / 透明度 / 形变 / 路径），推导步骤要按顺序出现
 - **缓动与时长**：缓动函数（ease-in / ease-out / linear / cubic-bezier）与每个动作的持续时长（秒）
 - **整体氛围**：配色（主色 / 辅色 / 背景色）、字体、风格基调（极简 / 卡通 / 科幻 / 课堂板书 等）
-- **镜头与版式**：版心比例 16:9、主要元素在屏幕的相对位置；字幕由播放器叠加，HTML 动画无需预留字幕区
+- **镜头与版式**：按上方画幅设计元素位置；竖屏优先上下排列，横屏可用左右分栏；字幕由播放器叠加，HTML 动画无需预留字幕区
 
 请把每个分镜的 \`prompt\` 写成一段连续的中文描述，描述清楚「画什么 + 怎么动 + 多长时间」，避免空泛形容词。`
       : `# 当前模式：图片轮播视频（适合人物传记、历史事件、文化科普等「画面 + 旁白讲解」）
@@ -172,6 +196,8 @@ function buildOutlineSystemPrompt(mode: ProjectType, globalStylePrompt?: string)
    - \`narration\`: 该分镜的旁白（与 script 中对应段一致）
    - \`prompt\`: 画面提示词（见下方模式说明；必须能回答「这一镜旁白在讲什么，画面应该看到什么」）
 
+${sizeBlock}
+
 ${modeBlock}
 
 ${globalStyleNote}
@@ -199,6 +225,7 @@ ${globalStyleNote}
 export function parseOutlineResponse(
   raw: string,
   mode: ProjectType,
+  videoSize: VideoSize,
   globalStylePrompt?: string,
 ): VideoOutline {
   const text = stripCodeFence(raw);
@@ -276,6 +303,7 @@ export function parseOutlineResponse(
   }
   return {
     mode,
+    videoSize,
     script: script.slice(0, 20000),
     globalStylePrompt:
       mode === "image" && globalStylePrompt

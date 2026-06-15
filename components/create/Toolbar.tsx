@@ -2,6 +2,7 @@
 
 import clsx from "clsx";
 import { Maximize2, MoreHorizontal, Pencil, Subtitles, Video } from "lucide-react";
+import type { VideoSize } from "@/lib/exportVideo";
 type ToolbarProps = {
   title: string;
   savedLabel: string;
@@ -14,6 +15,7 @@ type ToolbarProps = {
   onExportVideo: () => void;
   /** 是否禁用导出按钮（通常在大纲为空时） */
   exportDisabled?: boolean;
+  videoSize: VideoSize;
 };
 
 export function Toolbar({
@@ -23,6 +25,7 @@ export function Toolbar({
   onToggleSubtitle,
   onExportVideo,
   exportDisabled,
+  videoSize,
 }: ToolbarProps) {
   return (
     <div className="flex h-full w-full shrink-0 items-center justify-between gap-3 border-b border-ink-200/70 bg-white px-6">
@@ -35,6 +38,9 @@ export function Toolbar({
           <Pencil className="h-3.5 w-3.5" />
         </button>
         <span className="hidden truncate text-xs text-ink-400 sm:inline">{savedLabel}</span>
+        <span className="hidden rounded-md bg-ink-100 px-2 py-0.5 text-[10px] font-medium text-ink-600 lg:inline">
+          {videoSize.label}
+        </span>
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
