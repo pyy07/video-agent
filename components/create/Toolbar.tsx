@@ -2,7 +2,7 @@
 
 import clsx from "clsx";
 import { Maximize2, MoreHorizontal, Pencil, Subtitles, Video } from "lucide-react";
-import type { VideoSize } from "@/lib/exportVideo";
+import { VIDEO_SIZE_PRESETS, type VideoSize } from "@/lib/exportVideo";
 type ToolbarProps = {
   title: string;
   savedLabel: string;
@@ -16,6 +16,8 @@ type ToolbarProps = {
   /** 是否禁用导出按钮（通常在大纲为空时） */
   exportDisabled?: boolean;
   videoSize: VideoSize;
+  videoSizeLocked: boolean;
+  onVideoSizeChange: (size: VideoSize) => void;
 };
 
 export function Toolbar({
@@ -26,6 +28,8 @@ export function Toolbar({
   onExportVideo,
   exportDisabled,
   videoSize,
+  videoSizeLocked,
+  onVideoSizeChange,
 }: ToolbarProps) {
   return (
     <div className="flex h-full w-full shrink-0 items-center justify-between gap-3 border-b border-ink-200/70 bg-white px-6">
@@ -38,9 +42,28 @@ export function Toolbar({
           <Pencil className="h-3.5 w-3.5" />
         </button>
         <span className="hidden truncate text-xs text-ink-400 sm:inline">{savedLabel}</span>
-        <span className="hidden rounded-md bg-ink-100 px-2 py-0.5 text-[10px] font-medium text-ink-600 lg:inline">
-          {videoSize.label}
-        </span>
+        {!videoSizeLocked && (
+          <select
+            value={`${videoSize.width}x${videoSize.height}`}
+            onChange={(e) => {
+              const [w, h] = e.target.value.split("x").map(Number);
+              const preset = VIDEO_SIZE_PRESETS.find((p) => p.width === w && p.height === h);
+              if (preset) onVideoSizeChange(preset);
+            }}
+            className="cursor-pointer rounded-md border border-ink-200 bg-white px-2 py-1 text-[11px] font-medium text-ink-600 transition hover:border-ink-300 focus:border-brand-400 focus:outline-none focus:ring-1 focus:ring-brand-300"
+          >
+            {VIDEO_SIZE_PRESETS.map((preset) => (
+              <option key={`${preset.width}x${preset.height}`} value={`${preset.width}x${preset.height}`}>
+                {preset.label}
+              </option>
+            ))}
+          </select>
+        )}
+        {videoSizeLocked && (
+          <span className="hidden rounded-md bg-ink-100 px-2 py-0.5 text-[10px] font-medium text-ink-600 lg:inline">
+            {videoSize.label}
+          </span>
+        )}
       </div>
 
       <div className="flex shrink-0 items-center gap-2">

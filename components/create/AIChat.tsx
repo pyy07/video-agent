@@ -115,7 +115,7 @@ export function AIChat({
     <aside className="flex h-full min-h-0 w-full shrink-0 flex-col overflow-hidden bg-ink-50">
       {!hideHeader ? <AIChatHeader /> : null}
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3 pb-3">
         {toast ? (
           <div
             role="alert"

@@ -887,6 +887,8 @@ function SplitWorkspace(props: {
             onExportVideo={props.onOpenExport}
             exportDisabled={props.exportDisabled}
             videoSize={props.videoSize}
+            videoSizeLocked={props.videoSizeLocked}
+            onVideoSizeChange={props.onVideoSizeChange}
           />
         </div>
         <div
@@ -910,19 +912,6 @@ function SplitWorkspace(props: {
         <div className="flex min-h-0 flex-1 flex-col px-6">
           {props.hasProject ? (
             <div className="mx-auto flex h-full min-h-0 w-full max-w-5xl flex-col gap-3">
-              {!props.videoSizeLocked && (
-                <div className="shrink-0 rounded-xl border border-ink-200 bg-white px-4 py-3">
-                  <p className="mb-2 text-xs font-semibold text-ink-800">视频画幅</p>
-                  <VideoSizePicker
-                    compact
-                    value={props.videoSize}
-                    onChange={props.onVideoSizeChange}
-                  />
-                  <p className="mt-2 text-[11px] text-ink-500">
-                    请在生成分镜前选定画幅；生成后将锁定，避免导出变形。
-                  </p>
-                </div>
-              )}
               {!props.recordingMode ? (
                 <div className="min-h-0 flex-1">
                   <VideoPreview

@@ -4,8 +4,6 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { createProjectAction } from "@/app/actions";
 import type { ProjectType } from "@/lib/projectTypes";
-import { DEFAULT_VIDEO_SIZE, type VideoSize } from "@/lib/exportVideo";
-import { VideoSizePicker } from "@/components/create/VideoSizePicker";
 import {
   HtmlVideoIllustration,
   ImageCarouselIllustration,
@@ -16,7 +14,6 @@ export function CreateModeCards() {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [activeMode, setActiveMode] = useState<ProjectType | null>(null);
-  const [videoSize, setVideoSize] = useState<VideoSize>(DEFAULT_VIDEO_SIZE);
   const [error, setError] = useState<{
     mode: ProjectType;
     message: string;
@@ -27,7 +24,7 @@ export function CreateModeCards() {
     setActiveMode(mode);
     setError(null);
     startTransition(async () => {
-      const result = await createProjectAction(mode, videoSize);
+      const result = await createProjectAction(mode);
       if (!result.ok) {
         setError({ mode, message: result.error });
         setActiveMode(null);
@@ -41,14 +38,6 @@ export function CreateModeCards() {
 
   return (
     <section className="mt-12 w-full max-w-5xl">
-      <div className="mb-6 rounded-2xl border border-white/60 bg-white/80 p-5 shadow-soft backdrop-blur-sm">
-        <p className="mb-3 text-sm font-semibold text-ink-900">选择视频画幅</p>
-        <VideoSizePicker value={videoSize} onChange={setVideoSize} disabled={pending} />
-        <p className="mt-3 text-xs leading-relaxed text-ink-500">
-          画幅在创建项目时确定，AI 会按此比例设计分镜与动画；导出时不再切换，避免变形。
-        </p>
-      </div>
-
       <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
         <ModeCard
           theme="brand"
