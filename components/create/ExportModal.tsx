@@ -115,8 +115,8 @@ export function ExportModal({
                 title="允许共享当前标签页"
                 desc={
                   <>
-                    点击开始后，浏览器会弹出共享提示，请选择<b>当前标签页</b>并点「共享」。
-                    HTML 动画将按预览效果直接录制，支持 SVG、filter、drop-shadow 等全部 CSS 效果。
+                    点击开始后，浏览器会弹出共享提示，请选择<b>当前标签页</b>、勾选<b>共享标签页音频</b>，再点「共享」。
+                    HTML 动画将按预览效果直接录制。
                   </>
                 }
                 icon={<MonitorUp className="h-3.5 w-3.5" />}

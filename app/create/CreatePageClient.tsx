@@ -8,13 +8,26 @@ import { Sidebar } from "@/components/create/Sidebar";
 import { StoryboardList } from "@/components/create/StoryboardList";
 import { Toolbar } from "@/components/create/Toolbar";
 import { VideoPreview, type VideoPreviewHandle } from "@/components/create/VideoPreview";
+import {
+  HtmlStudioPreview,
+  type HtmlStudioPreviewHandle,
+} from "@/components/create/HtmlStudioPreview";
+import {
+  ExportRecordingOverlay,
+  type HtmlExportStatus,
+} from "@/components/create/ExportRecordingOverlay";
+import { loadSceneDurations } from "@/components/create/useVideoPlayer";
 import { OutlineModal } from "@/components/create/OutlineModal";
 import { ExportModal } from "@/components/create/ExportModal";
+import { applyRecordingFocus, clearRecordingFocus } from "@/lib/recordingFocus";
+import {
+  isWebCodecsMP4Supported,
+  recordStreamToMP4,
+} from "@/lib/webcodecs-mp4-encoder";
 import { VideoSizePicker } from "@/components/create/VideoSizePicker";
 import {
   downloadBlob,
   startRecordingFromCanvas,
-  startRecordingFromDisplayMedia,
   type RecordingHandle,
 } from "@/lib/recorder";
 import {
@@ -100,13 +113,36 @@ export default function CreatePageClient({
    */
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [recordingMode, setRecordingMode] = useState(false);
-  /** recorder 连上 canvas 后才允许全屏预览自动播放 */
+  /** recorder 连上 canvas 后才允许全屏预览自动播放（仅图片模式） */
   const [recordingCaptureReady, setRecordingCaptureReady] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  /** HTML 录屏导出状态（对齐 ai-video-agent） */
+  const [htmlExportJob, setHtmlExportJob] = useState<{
+    status: HtmlExportStatus;
+    message: string;
+    progress: number;
+    countdown: number;
+    elapsedSec: number;
+    remainingSec: number;
+  }>({
+    status: "idle",
+    message: "",
+    progress: 0,
+    countdown: 3,
+    elapsedSec: 0,
+    remainingSec: 0,
+  });
   const recordingHandleRef = useRef<RecordingHandle | null>(null);
   const recordingFrameBridgeRef = useRef<(() => void) | null>(null);
-  // VideoPreview 通过 ref 暴露录制 canvas 和当前正在播放的 <audio>
   const videoPreviewRef = useRef<VideoPreviewHandle | null>(null);
+  const htmlStudioPreviewRef = useRef<HtmlStudioPreviewHandle | null>(null);
+  const htmlMediaStreamRef = useRef<MediaStream | null>(null);
+  const htmlFocusStateRef = useRef<{ style: string; attr: string | null } | null>(null);
+  const htmlExportJobRef = useRef(htmlExportJob);
+  const htmlExportAbortRef = useRef<AbortController | null>(null);
+  const htmlExportFinalizingRef = useRef(false);
+  const htmlExportCompletionRequestedRef = useRef(false);
+  const htmlProgressWindowRef = useRef<Window | null>(null);
   const bulkAbortRef = useRef<boolean>(false);
   /** 区分「首次进入页面」与「切换项目」，避免清空服务端预载的大纲导致预览闪空白 */
   const prevActiveProjectIdRef = useRef<string | null>(null);
@@ -122,6 +158,7 @@ export default function CreatePageClient({
   );
   const videoSizeLocked = hasGeneratedSceneAssets(outline);
   const scenes = outline?.scenes ?? [];
+  const projectType = project?.type ?? mode;
   const activeScene = useMemo(() => {
     if (!activeSceneId) return null;
     const m = activeSceneId.match(/^s-(\d+)$/);
@@ -129,6 +166,25 @@ export default function CreatePageClient({
     const idx = Number(m[1]);
     return scenes.find((s) => s.index === idx) ?? null;
   }, [activeSceneId, scenes]);
+
+  const activeSceneIndex = useMemo(() => {
+    if (!activeSceneId) return 0;
+    const m = activeSceneId.match(/^s-(\d+)$/);
+    if (!m) return 0;
+    const idx = Number(m[1]);
+    const i = scenes.findIndex((s) => s.index === idx);
+    return i >= 0 ? i : 0;
+  }, [activeSceneId, scenes]);
+
+  const lastSceneIndex = Math.max(0, scenes.length - 1);
+  const [htmlPlayerState, setHtmlPlayerState] = useState({
+    isPlaying: false,
+    currentIndex: 0,
+  });
+
+  useEffect(() => {
+    htmlExportJobRef.current = htmlExportJob;
+  }, [htmlExportJob]);
 
   // 切到新项目时：拉聊天历史和故事板；仅在真正切换项目时清空大纲
   useEffect(() => {
@@ -447,23 +503,396 @@ export default function CreatePageClient({
     setExportModalOpen(true);
   }, [outline]);
 
-  const projectType = project?.type ?? mode;
+  function stopHtmlMediaStream(stream: MediaStream) {
+    for (const track of stream.getTracks()) {
+      track.stop();
+    }
+  }
+
+  function closeHtmlProgressWindow() {
+    const w = htmlProgressWindowRef.current;
+    if (w && !w.closed) {
+      try {
+        w.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    htmlProgressWindowRef.current = null;
+  }
+
+  function createHtmlProgressWindow(durationSec: number): Window | null {
+    const w = window.open(
+      "",
+      "export_progress",
+      "width=320,height=240,top=100,left=100,toolbar=no,menubar=no,scrollbars=no,resizable=no",
+    );
+    htmlProgressWindowRef.current = w;
+    if (w) {
+      w.document.write(`<!DOCTYPE html><html><head><title>录制进度</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:linear-gradient(135deg,#1e293b,#0f172a);color:#fff;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+.dot{width:12px;height:12px;background:#ef4444;border-radius:50%;animation:pulse 1s ease-in-out infinite;margin-bottom:16px}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.9)}}
+.badge{font-size:11px;color:#22c55e;background:rgba(34,197,94,.15);padding:2px 8px;border-radius:4px;margin-bottom:12px}
+.title{font-size:14px;color:#94a3b8;margin-bottom:12px}
+.wrap{width:100%;max-width:240px;height:8px;background:#334155;border-radius:4px;overflow:hidden;margin-bottom:12px}
+.bar{height:100%;background:linear-gradient(90deg,#f97316,#fb923c);border-radius:4px;transition:width .1s}
+.pct{font-size:24px;font-weight:600}
+.remain{font-size:12px;color:#64748b;margin-top:8px}
+</style></head><body>
+<div class="dot"></div>
+<div class="badge">MP4 (H.264)</div>
+<div class="title">正在录制...</div>
+<div class="wrap"><div class="bar" id="bar" style="width:0%"></div></div>
+<div class="pct" id="pct">0%</div>
+<div class="remain" id="remain">剩余: ${durationSec}s</div>
+</body></html>`);
+      w.document.close();
+    }
+    return w;
+  }
+
+  function updateHtmlProgressWindow(pct: number, remainingSec: number) {
+    const w = htmlProgressWindowRef.current;
+    if (!w || w.closed) return;
+    try {
+      const bar = w.document.getElementById("bar");
+      const pctEl = w.document.getElementById("pct");
+      const remain = w.document.getElementById("remain");
+      if (bar) bar.style.width = `${pct}%`;
+      if (pctEl) pctEl.textContent = `${pct}%`;
+      if (remain) {
+        remain.textContent =
+          remainingSec < 0
+            ? `进度: ${pct}%`
+            : `剩余: ${Math.ceil(Math.max(0, remainingSec))}s`;
+      }
+    } catch {
+      /* popup may be closed */
+    }
+  }
+
+  function cleanupHtmlExportRecorder() {
+    if (htmlMediaStreamRef.current) {
+      stopHtmlMediaStream(htmlMediaStreamRef.current);
+    }
+    htmlMediaStreamRef.current = null;
+    htmlExportAbortRef.current = null;
+    htmlExportCompletionRequestedRef.current = false;
+  }
+
+  function exitHtmlRecordingFocus() {
+    clearRecordingFocus(
+      htmlStudioPreviewRef.current?.getPreviewStage() ?? null,
+      htmlFocusStateRef,
+    );
+    closeHtmlProgressWindow();
+  }
+
+  const finalizeHtmlExport = useCallback(async (reason: "completed" | "cancelled") => {
+    if (htmlExportFinalizingRef.current) return;
+    htmlExportFinalizingRef.current = true;
+
+    try {
+      const stream = htmlMediaStreamRef.current;
+
+      if (!stream) {
+        cleanupHtmlExportRecorder();
+        exitHtmlRecordingFocus();
+        htmlStudioPreviewRef.current?.stop();
+        setHtmlExportJob({
+          status: "idle",
+          message: "",
+          progress: 0,
+          countdown: 3,
+          elapsedSec: 0,
+          remainingSec: 0,
+        });
+        return;
+      }
+
+      if (reason === "cancelled") {
+        htmlExportAbortRef.current?.abort();
+        cleanupHtmlExportRecorder();
+        exitHtmlRecordingFocus();
+        htmlStudioPreviewRef.current?.stop();
+        setHtmlExportJob({
+          status: "idle",
+          message: "",
+          progress: 0,
+          countdown: 3,
+          elapsedSec: 0,
+          remainingSec: 0,
+        });
+        return;
+      }
+
+      if (htmlExportCompletionRequestedRef.current) {
+        return;
+      }
+      htmlExportCompletionRequestedRef.current = true;
+      setHtmlExportJob((job) => ({
+        ...job,
+        status: "finalizing",
+        message: "正在封装 MP4 文件…",
+      }));
+      stopHtmlMediaStream(stream);
+    } finally {
+      htmlExportFinalizingRef.current = false;
+    }
+  }, []);
+
+  const handleCancelHtmlExport = useCallback(() => {
+    void finalizeHtmlExport("cancelled");
+  }, [finalizeHtmlExport]);
+
+  useEffect(() => {
+    if (htmlExportJob.status !== "recording") return;
+    if (htmlPlayerState.isPlaying) return;
+    if (htmlPlayerState.currentIndex < lastSceneIndex) return;
+    void finalizeHtmlExport("completed");
+  }, [htmlExportJob.status, lastSceneIndex, htmlPlayerState, finalizeHtmlExport]);
+
+  const beginHtmlCountdownAndRecord = useCallback(
+    async (stream: MediaStream, totalDuration: number) => {
+      let remaining = 3;
+
+      flushSync(() => {
+        setHtmlExportJob({
+          status: "countdown",
+          message: "录屏即将开始",
+          progress: 0,
+          elapsedSec: 0,
+          remainingSec: totalDuration,
+          countdown: remaining,
+        });
+      });
+
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      );
+
+      applyRecordingFocus(
+        htmlStudioPreviewRef.current?.getPreviewStage() ?? null,
+        htmlFocusStateRef,
+      );
+
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      );
+
+      await new Promise<void>((resolve) => {
+        const timer = window.setInterval(() => {
+          remaining -= 1;
+          if (remaining <= 0) {
+            window.clearInterval(timer);
+            resolve();
+            return;
+          }
+          setHtmlExportJob((job) => ({
+            ...job,
+            countdown: remaining,
+          }));
+        }, 1000);
+      });
+
+      const controller = new AbortController();
+      htmlExportAbortRef.current = controller;
+
+      setHtmlExportJob({
+        status: "recording",
+        message: "正在录制并编码 MP4…",
+        progress: 0,
+        elapsedSec: 0,
+        remainingSec: totalDuration,
+        countdown: 0,
+      });
+
+      htmlStudioPreviewRef.current?.playFromIndex(0);
+      createHtmlProgressWindow(Math.round(totalDuration));
+
+      try {
+        const blob = await recordStreamToMP4(stream, Math.max(totalDuration, 1), {
+          frameRate: 30,
+          maxWidth: videoSize.width,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            setHtmlExportJob((job) => ({
+              ...job,
+              status: progress >= 100 ? "finalizing" : "recording",
+              progress,
+              message: progress >= 100 ? "正在封装 MP4 文件…" : "正在录制并编码 MP4…",
+            }));
+          },
+          onTimeUpdate: (elapsedSec, remainingSec) => {
+            setHtmlExportJob((job) => ({
+              ...job,
+              elapsedSec,
+              remainingSec,
+            }));
+            updateHtmlProgressWindow(
+              Math.min(99, Math.round((elapsedSec / Math.max(totalDuration, 1)) * 100)),
+              remainingSec,
+            );
+          },
+        });
+
+        const projectTitle = project?.title?.replace(/[^\w一-龥-]+/g, "_") || "video";
+        const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+        downloadBlob(blob, `${projectTitle}_${videoSize.width}x${videoSize.height}_${stamp}.mp4`);
+        cleanupHtmlExportRecorder();
+        exitHtmlRecordingFocus();
+        htmlStudioPreviewRef.current?.stop();
+        setHtmlExportJob({
+          status: "idle",
+          message: "",
+          progress: 100,
+          elapsedSec: totalDuration,
+          remainingSec: 0,
+          countdown: 0,
+        });
+      } catch (error) {
+        cleanupHtmlExportRecorder();
+        exitHtmlRecordingFocus();
+        htmlStudioPreviewRef.current?.stop();
+        if (error instanceof DOMException && error.name === "AbortError") {
+          setHtmlExportJob({
+            status: "idle",
+            message: "",
+            progress: 0,
+            countdown: 3,
+            elapsedSec: 0,
+            remainingSec: 0,
+          });
+          return;
+        }
+        throw error;
+      }
+    },
+    [project?.title, videoSize.width, videoSize.height],
+  );
+
+  const handleHtmlExport = useCallback(async () => {
+    if (!outline || outline.scenes.length === 0) return;
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices?.getDisplayMedia ||
+      !isWebCodecsMP4Supported()
+    ) {
+      throw new Error("当前浏览器不支持 MP4 录屏导出，请使用最新版 Chrome。");
+    }
+
+    const { totalSec } = await loadSceneDurations(
+      outline.scenes,
+      activeProjectId,
+      outline.audioGeneratedAt,
+    );
+    const totalDuration = totalSec > 0 ? totalSec : outline.scenes.length * 3;
+
+    setHtmlExportJob({
+      status: "prompting",
+      message: "请在共享弹窗中选择当前标签页，并勾选共享标签页音频。",
+      progress: 0,
+      elapsedSec: 0,
+      remainingSec: totalDuration,
+      countdown: 3,
+    });
+    htmlExportCompletionRequestedRef.current = false;
+
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 30 },
+      audio: true,
+      preferCurrentTab: true,
+      selfBrowserSurface: "include",
+      surfaceSwitching: "exclude",
+    } as DisplayMediaStreamOptions & {
+      preferCurrentTab?: boolean;
+      selfBrowserSurface?: "include" | "exclude";
+      surfaceSwitching?: "include" | "exclude";
+    });
+
+    const displaySurface = stream.getVideoTracks()[0]?.getSettings().displaySurface;
+    if (displaySurface && displaySurface !== "browser") {
+      stopHtmlMediaStream(stream);
+      throw new Error("请选择「当前标签页」进行录制。");
+    }
+
+    htmlMediaStreamRef.current = stream;
+
+    for (const track of stream.getTracks()) {
+      track.addEventListener(
+        "ended",
+        () => {
+          const status = htmlExportJobRef.current.status;
+          if (
+            status === "recording" ||
+            status === "countdown" ||
+            status === "prompting" ||
+            status === "finalizing"
+          ) {
+            void finalizeHtmlExport("completed");
+          }
+        },
+        { once: true },
+      );
+    }
+
+    await beginHtmlCountdownAndRecord(stream, totalDuration);
+  }, [
+    outline,
+    activeProjectId,
+    beginHtmlCountdownAndRecord,
+    finalizeHtmlExport,
+  ]);
 
   /**
    * 弹窗点"开始录制"：
-   *  - 图片轮播：隐藏 canvas 编码
-   *  - HTML 视频：getDisplayMedia 采集预览区
+   *  - HTML：getDisplayMedia + 主预览区 applyRecordingFocus + recordStreamToMP4（对齐 ai-video-agent）
+   *  - 图片：隐藏 canvas 编码 + 全屏覆盖层 VideoPreview
    */
   const handleStartExport = useCallback(async (): Promise<void> => {
     setExportError(null);
+    setExportModalOpen(false);
+
+    if (projectType === "html") {
+      try {
+        await handleHtmlExport();
+      } catch (err) {
+        cleanupHtmlExportRecorder();
+        exitHtmlRecordingFocus();
+        htmlStudioPreviewRef.current?.stop();
+        if (err instanceof DOMException && (err.name === "AbortError" || err.name === "NotAllowedError")) {
+          setHtmlExportJob({
+            status: "idle",
+            message: "",
+            progress: 0,
+            countdown: 3,
+            elapsedSec: 0,
+            remainingSec: 0,
+          });
+          return;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        setHtmlExportJob({
+          status: "failed",
+          message: msg,
+          progress: 0,
+          countdown: 3,
+          elapsedSec: 0,
+          remainingSec: 0,
+        });
+        setExportError(`视频导出失败：${msg}`);
+        throw err;
+      }
+      return;
+    }
 
     flushSync(() => {
-      setExportModalOpen(false);
       setRecordingCaptureReady(false);
       setRecordingMode(true);
     });
 
-    const isHtmlProject = projectType === "html";
     const recorderConfig = {
       frameRate: 30,
       width: videoSize.width,
@@ -475,28 +904,17 @@ export default function CreatePageClient({
     try {
       await waitForCaptureRegion(
         () => videoPreviewRef.current?.getCaptureRegion() ?? null,
-        isHtmlProject ? videoSize.width : 0,
-        isHtmlProject ? videoSize.height : 0,
+        0,
+        0,
         5000,
       );
 
-      let handle: RecordingHandle;
-
-      if (isHtmlProject) {
-        const region = videoPreviewRef.current?.getCaptureRegion();
-        if (!region) {
-          throw new Error("预览区域尚未就绪，请稍后再试。");
-        }
-        handle = await startRecordingFromDisplayMedia(region, recorderConfig);
-        recordingFrameBridgeRef.current = null;
-      } else {
-        const canvas = videoPreviewRef.current?.getRecordingCanvas();
-        if (!canvas) {
-          throw new Error("录制画布尚未就绪，请稍后再试。");
-        }
-        handle = await startRecordingFromCanvas(canvas, recorderConfig);
-        recordingFrameBridgeRef.current = () => handle.notifyFrameDrawn();
+      const canvas = videoPreviewRef.current?.getRecordingCanvas();
+      if (!canvas) {
+        throw new Error("录制画布尚未就绪，请稍后再试。");
       }
+      const handle = await startRecordingFromCanvas(canvas, recorderConfig);
+      recordingFrameBridgeRef.current = () => handle.notifyFrameDrawn();
 
       recordingHandleRef.current = handle;
 
@@ -514,7 +932,7 @@ export default function CreatePageClient({
       setRecordingMode(false);
       throw err;
     }
-  }, [projectType, videoSize]);
+  }, [projectType, videoSize, handleHtmlExport]);
 
   const handleVideoSizeChange = useCallback(
     async (next: VideoSize) => {
@@ -643,6 +1061,19 @@ export default function CreatePageClient({
         onRecordingComplete={handleRecordingComplete}
         onRecordingCancel={handleRecordingCancel}
         videoPreviewRef={videoPreviewRef}
+        htmlStudioPreviewRef={htmlStudioPreviewRef}
+        activeSceneIndex={activeSceneIndex}
+        onHtmlSceneIndexChange={(index) => {
+          const sc = scenes[index];
+          if (sc) setActiveSceneId(`s-${sc.index}`);
+        }}
+        onHtmlPlayerStateChange={setHtmlPlayerState}
+        htmlExportBusy={htmlExportJob.status !== "idle" && htmlExportJob.status !== "failed"}
+        htmlRecordingCapture={
+          htmlExportJob.status === "countdown" ||
+          htmlExportJob.status === "recording" ||
+          htmlExportJob.status === "finalizing"
+        }
         onAudioElementChange={handleAudioElementChange}
         videoSize={videoSize}
         videoSizeLocked={videoSizeLocked}
@@ -670,6 +1101,28 @@ export default function CreatePageClient({
         videoSize={videoSize}
       />
 
+      <ExportRecordingOverlay
+        open={htmlExportJob.status !== "idle" && htmlExportJob.status !== "failed"}
+        status={htmlExportJob.status}
+        message={htmlExportJob.message}
+        countdown={htmlExportJob.countdown}
+      />
+
+      {htmlExportJob.status !== "idle" &&
+        htmlExportJob.status !== "failed" &&
+        htmlExportJob.status !== "recording" &&
+        htmlExportJob.status !== "finalizing" && (
+          <div className="fixed bottom-6 left-6 z-[2147483647]">
+            <button
+              type="button"
+              onClick={handleCancelHtmlExport}
+              className="rounded-lg border border-ink-700 bg-ink-950/90 px-3 py-1.5 text-xs text-white shadow-lg hover:bg-ink-900"
+            >
+              取消导出
+            </button>
+          </div>
+        )}
+
       {exportError && (
         <div className="fixed bottom-6 right-6 z-50 max-w-md rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 shadow-soft">
           {exportError}
@@ -683,9 +1136,8 @@ export default function CreatePageClient({
         </div>
       )}
 
-      {/* 全屏录制覆盖层：recordingMode=true 时铺满整个视口，只渲染 VideoPreview。
-          canvas 在该模式自动进入渲染循环，recorder 抓流即可。 */}
-      {recordingMode && outline && (
+      {/* 图片模式全屏录制覆盖层 */}
+      {recordingMode && outline && projectType !== "html" && (
         <div
           className="fixed inset-0 z-[60] flex flex-col bg-black"
           role="dialog"
@@ -712,21 +1164,6 @@ export default function CreatePageClient({
               videoSize={videoSize}
             />
           </div>
-          {projectType === "html" && (
-            <div className="flex shrink-0 items-center justify-between gap-3 border-t border-white/10 bg-black px-4 py-2 text-xs text-white/75">
-              <span className="flex items-center gap-2">
-                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" />
-                录制中 · 播完自动下载
-              </span>
-              <button
-                type="button"
-                onClick={handleRecordingCancel}
-                className="rounded-md px-2.5 py-1 text-white/90 transition hover:bg-white/10"
-              >
-                取消录制
-              </button>
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -773,8 +1210,15 @@ function SplitWorkspace(props: {
   onRecordingComplete: () => void;
   /** 录屏取消：用户点 X，recorder.cancel() */
   onRecordingCancel: () => void;
-  /** VideoPreview ref（录制时父级要从它拿 canvas 和当前 audio） */
+  /** VideoPreview ref（图片录制时父级要从它拿 canvas 和当前 audio） */
   videoPreviewRef: React.MutableRefObject<VideoPreviewHandle | null>;
+  /** HTML 预览 ref（录屏导出时 applyRecordingFocus + playFromIndex） */
+  htmlStudioPreviewRef: React.MutableRefObject<HtmlStudioPreviewHandle | null>;
+  activeSceneIndex: number;
+  onHtmlSceneIndexChange: (index: number) => void;
+  onHtmlPlayerStateChange: (state: { isPlaying: boolean; currentIndex: number }) => void;
+  htmlExportBusy: boolean;
+  htmlRecordingCapture: boolean;
   /** VideoPreview 内部 audio 切换时通知父级 */
   onAudioElementChange: (audio: HTMLAudioElement | null) => void;
   videoSize: VideoSize;
@@ -914,22 +1358,38 @@ function SplitWorkspace(props: {
             <div className="mx-auto flex h-full min-h-0 w-full max-w-5xl flex-col gap-3">
               {!props.recordingMode ? (
                 <div className="min-h-0 flex-1">
-                  <VideoPreview
-                    key={props.projectId ?? "empty"}
-                    ref={props.videoPreviewRef}
-                    scene={props.activeScene}
-                    showSubtitle={props.subtitleOn}
-                    projectId={props.projectId}
-                    allScenes={props.scenes}
-                    audioGeneratedAt={props.liveOutline?.audioGeneratedAt}
-                    projectType={props.projectType}
-                    recordingMode={false}
-                    onRecordingComplete={props.onRecordingComplete}
-                    onRecordingCancel={props.onRecordingCancel}
-                    onAudioElementChange={props.onAudioElementChange}
-                    fillContainer
-                    videoSize={props.videoSize}
-                  />
+                  {props.projectType === "html" ? (
+                    <HtmlStudioPreview
+                      ref={props.htmlStudioPreviewRef}
+                      scenes={props.scenes}
+                      activeSceneIndex={props.activeSceneIndex}
+                      projectId={props.projectId}
+                      audioGeneratedAt={props.liveOutline?.audioGeneratedAt}
+                      showSubtitle={props.subtitleOn}
+                      videoSize={props.videoSize}
+                      exportBusy={props.htmlExportBusy}
+                      recordingCapture={props.htmlRecordingCapture}
+                      onSceneIndexChange={props.onHtmlSceneIndexChange}
+                      onPlayerStateChange={props.onHtmlPlayerStateChange}
+                    />
+                  ) : (
+                    <VideoPreview
+                      key={props.projectId ?? "empty"}
+                      ref={props.videoPreviewRef}
+                      scene={props.activeScene}
+                      showSubtitle={props.subtitleOn}
+                      projectId={props.projectId}
+                      allScenes={props.scenes}
+                      audioGeneratedAt={props.liveOutline?.audioGeneratedAt}
+                      projectType={props.projectType}
+                      recordingMode={false}
+                      onRecordingComplete={props.onRecordingComplete}
+                      onRecordingCancel={props.onRecordingCancel}
+                      onAudioElementChange={props.onAudioElementChange}
+                      fillContainer
+                      videoSize={props.videoSize}
+                    />
+                  )}
                 </div>
               ) : (
                 <div className="min-h-0 flex-1" aria-hidden />

@@ -46,3 +46,18 @@
     @apply rounded-2xl border border-ink-200/70 bg-white shadow-soft;
   }
 }
+
+@keyframes frame-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes frame-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+.frame-fade-in {
+  animation: frame-fade-in 500ms ease-out forwards;
+}
+.frame-fade-out {
+  animation: frame-fade-out 500ms ease-out forwards;
+}

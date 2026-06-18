@@ -91,7 +91,7 @@ const RECORDING_FRAME_MS = 1000 / RECORDING_FPS;
 const HTML_IFRAME_PRELOAD_STAGGER_MS = 200;
 
 /** embed 注入逻辑变更时递增，避免浏览器 304 复用旧 HTML */
-const SCENE_EMBED_REV = 8;
+const SCENE_EMBED_REV = 9;
 
 function sceneHtmlUrl(
   projectId: string,
@@ -220,8 +220,15 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
     const useFullAudioRef = useRef(false);
     // 各镜在整片 mp3 中的起始秒数
     const sceneStartSecRef = useRef<Record<number, number>>({});
+    const htmlRecordingRef = useRef(false);
+    htmlRecordingRef.current = recordingMode && isHtmlMode;
+
     const currentIndexRef = useRef(currentIndex);
-    useEffect(() => {
+    const applyCurrentIndex = useCallback((idx: number) => {
+      currentIndexRef.current = idx;
+      setCurrentIndex(idx);
+    }, []);
+    useLayoutEffect(() => {
       currentIndexRef.current = currentIndex;
     }, [currentIndex]);
     // 包装赋值：每次换 audio 都通知父级（recorder 要 setAudioElement 跟）
@@ -541,6 +548,22 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
           return;
         }
 
+        // HTML 录制：硬切单 iframe，叠化会导致下一镜动画在 opacity=0 时播完
+        if (htmlRecordingRef.current) {
+          if (fadeoutTimerRef.current) clearTimeout(fadeoutTimerRef.current);
+          fadeoutTimerRef.current = null;
+          fadeStartedAtRef.current = null;
+          fadeOutgoingSceneRef.current = null;
+          setPrevScene(null);
+          setPrevOpacity(1);
+          applyCurrentIndex(targetIndex);
+          setCurrentOpacity(1);
+          sceneElapsedRef.current = elapsedInScene;
+          setCurrentTime(elapsedInScene);
+          audioSyncedSceneIndexRef.current = targetIndex;
+          return;
+        }
+
         const outgoing = allScenes[fromIndex];
         if (fadeoutTimerRef.current) clearTimeout(fadeoutTimerRef.current);
 
@@ -562,20 +585,21 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
           fadeoutTimerRef.current = null;
         }, FADE_DURATION_MS);
       },
-      [allScenes],
+      [allScenes, applyCurrentIndex],
     );
 
     // 切到下一个分镜（叠化过渡，仅分镜 mp3 逐镜播放时使用）
     const advanceToNext = useCallback(() => {
       clearAll();
+      const idx = currentIndexRef.current;
       // 整片 mp3 连续播放，切镜时不暂停/重启音频
-      if (currentIndex >= allScenes.length - 1) {
+      if (idx >= allScenes.length - 1) {
         isRunningRef.current = false;
         setIsPlaying(false);
         if (recordingMode) {
           onRecordingComplete?.();
         } else {
-          setCurrentIndex(0);
+          applyCurrentIndex(0);
           setCurrentTime(0);
           sceneElapsedRef.current = 0;
           clearPrevLayer();
@@ -583,7 +607,23 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         return;
       }
 
-      const outgoing = allScenes[currentIndex];
+      if (fadeoutTimerRef.current) clearTimeout(fadeoutTimerRef.current);
+
+      if (htmlRecordingRef.current) {
+        fadeStartedAtRef.current = null;
+        fadeOutgoingSceneRef.current = null;
+        setPrevScene(null);
+        setPrevOpacity(1);
+        const nextIndex = idx + 1;
+        applyCurrentIndex(nextIndex);
+        setCurrentTime(0);
+        sceneElapsedRef.current = 0;
+        setCurrentOpacity(1);
+        audioSyncedSceneIndexRef.current = nextIndex;
+        return;
+      }
+
+      const outgoing = allScenes[idx];
       if (fadeoutTimerRef.current) clearTimeout(fadeoutTimerRef.current);
 
       fadeStartedAtRef.current = performance.now();
@@ -592,8 +632,8 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       setPrevScene(outgoing ?? null);
       setPrevOpacity(1);
 
-      const nextIndex = currentIndex + 1;
-      setCurrentIndex(nextIndex);
+      const nextIndex = idx + 1;
+      applyCurrentIndex(nextIndex);
       setCurrentTime(0);
       sceneElapsedRef.current = 0;
       setCurrentOpacity(0);
@@ -605,7 +645,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
         setCurrentOpacity(1);
         fadeoutTimerRef.current = null;
       }, FADE_DURATION_MS);
-    }, [currentIndex, allScenes, clearAll, clearPrevLayer, recordingMode, onRecordingComplete]);
+    }, [allScenes, clearAll, clearPrevLayer, recordingMode, onRecordingComplete, applyCurrentIndex]);
 
     // 整片 mp3：按音频时钟同步镜序号与叠化，不切音频
     const syncPlaybackFromAudioClock = useCallback(() => {
@@ -636,7 +676,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       if (audioSyncedSceneIndexRef.current < 0) {
         audioSyncedSceneIndexRef.current = clock.sceneIndex;
         if (clock.sceneIndex !== currentIndexRef.current) {
-          setCurrentIndex(clock.sceneIndex);
+          applyCurrentIndex(clock.sceneIndex);
         }
         return;
       }
@@ -644,7 +684,7 @@ export const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(
       if (sceneChanged) {
         beginCrossfadeToScene(clock.sceneIndex, clock.sceneElapsed);
       }
-    }, [allScenes, sceneDurations, beginCrossfadeToScene]);
+    }, [allScenes, sceneDurations, beginCrossfadeToScene, applyCurrentIndex]);
 
     // 播放中：audio.timeupdate 驱动字幕刷新；整片 mp3 同时同步切镜（不用 setInterval 重复跑）
     useEffect(() => {
@@ -1726,15 +1766,29 @@ function HtmlSceneLayers({
   }, [allScenes, currentIndex, prevScene]);
 
   const renderIndices = useMemo(() => {
-    if (!recordingOnly) return mountedIndices;
-    const indices = new Set<number>();
-    const cur = allScenes[currentIndex];
-    if (cur?.htmlPath) indices.add(cur.index);
-    if (prevScene?.htmlPath) indices.add(prevScene.index);
-    const next = allScenes[currentIndex + 1];
-    if (next?.htmlPath) indices.add(next.index);
-    return [...indices].sort((a, b) => a - b);
-  }, [recordingOnly, mountedIndices, allScenes, currentIndex, prevScene]);
+    return mountedIndices;
+  }, [mountedIndices]);
+
+  // HTML 录制：单 iframe + key 重挂载，保证每镜动画从头播放
+  if (recordingOnly) {
+    const recordingSc = allScenes[currentIndex];
+    if (!projectId || !sceneTimelineReady || !recordingSc?.htmlPath) {
+      return <div className="absolute inset-0 bg-black" aria-hidden />;
+    }
+    const dur = effectiveSceneDurationSec(recordingSc, sceneDurations);
+    const url = sceneHtmlUrl(projectId, recordingSc.index, videoSize, dur, true);
+    return (
+      <iframe
+        key={`rec-${recordingSc.index}-${currentIndex}`}
+        src={url}
+        title={`录制 分镜 ${recordingSc.index}`}
+        className="absolute inset-0 h-full w-full border-0 bg-black"
+        sandbox="allow-scripts allow-same-origin"
+        tabIndex={-1}
+        data-recording-scene="1"
+      />
+    );
+  }
 
   return (
     <>
